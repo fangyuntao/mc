@@ -21,14 +21,20 @@ package cmd
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go/v3"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 	"github.com/muesli/termenv"
 )
 
@@ -61,16 +67,21 @@ const (
 )
 
 var (
-	globalQuiet          = false               // Quiet flag set via command line
-	globalJSON           = false               // Json flag set via command line
-	globalJSONLine       = false               // Print json as single line.
-	globalDebug          = false               // Debug flag set via command line
-	globalNoColor        = false               // No Color flag set via command line
-	globalInsecure       = false               // Insecure flag set via command line
-	globalDevMode        = false               // dev flag set via command line
-	globalAirgapped      = false               // Airgapped flag set via command line
-	globalSubnetProxyURL *url.URL              // Proxy to be used for communication with subnet
-	globalSubnetConfig   []madmin.SubsysConfig // Subnet config
+	globalQuiet        = false               // Quiet flag set via command line
+	globalJSON         = false               // Json flag set via command line
+	globalJSONLine     = false               // Print json as single line.
+	globalDebug        = false               // Debug flag set via command line
+	globalNoColor      = false               // No Color flag set via command line
+	globalInsecure     = false               // Insecure flag set via command line
+	globalResolvers    map[string]netip.Addr // Custom mappings from HOST[:PORT] to IP
+	globalAirgapped    = false               // Airgapped flag set via command line
+	globalSubnetConfig []madmin.SubsysConfig // Subnet config
+
+	// GlobalDevMode is set to true if the program is running in development mode
+	GlobalDevMode = false
+
+	// GlobalSubnetProxyURL is the proxy to be used for communication with subnet
+	GlobalSubnetProxyURL *url.URL
 
 	globalConnReadDeadline  time.Duration
 	globalConnWriteDeadline time.Duration
@@ -85,21 +96,34 @@ var (
 	// Terminal height/width, zero if not found
 	globalTermWidth, globalTermHeight int
 
-	globalHelpPager *termPager
+	globalDisablePagerEnv       = "DISABLE_PAGER"
+	globalDisablePagerFlag      = "--disable-pager"
+	globalDisablePagerFlagShort = "--dp"
+	globalPagerDisabled         = false
+	globalHelpPager             *termPager
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
 )
 
+func parsePagerDisableFlag(args []string) {
+	globalPagerDisabled, _ = strconv.ParseBool(os.Getenv(envPrefix + globalDisablePagerEnv))
+	for _, arg := range args {
+		if arg == globalDisablePagerFlag || arg == globalDisablePagerFlagShort {
+			globalPagerDisabled = true
+		}
+	}
+}
+
 // Set global states. NOTE: It is deliberately kept monolithic to ensure we dont miss out any flags.
 func setGlobalsFromContext(ctx *cli.Context) error {
-	quiet := ctx.IsSet("quiet") || ctx.GlobalIsSet("quiet")
-	debug := ctx.IsSet("debug") || ctx.GlobalIsSet("debug")
-	json := ctx.IsSet("json") || ctx.GlobalIsSet("json")
-	noColor := ctx.IsSet("no-color") || ctx.GlobalIsSet("no-color")
-	insecure := ctx.IsSet("insecure") || ctx.GlobalIsSet("insecure")
-	devMode := ctx.IsSet("dev") || ctx.GlobalIsSet("dev")
-	airgapped := ctx.IsSet("airgap") || ctx.GlobalIsSet("airgap")
+	quiet := ctx.Bool("quiet") || ctx.GlobalBool("quiet")
+	debug := ctx.Bool("debug") || ctx.GlobalBool("debug")
+	json := ctx.Bool("json") || ctx.GlobalBool("json")
+	noColor := ctx.Bool("no-color") || ctx.GlobalBool("no-color")
+	insecure := ctx.Bool("insecure") || ctx.GlobalBool("insecure")
+	devMode := ctx.Bool("dev") || ctx.GlobalBool("dev")
+	airgapped := ctx.Bool("airgap") || ctx.GlobalBool("airgap")
 
 	globalQuiet = globalQuiet || quiet
 	globalDebug = globalDebug || debug
@@ -107,7 +131,7 @@ func setGlobalsFromContext(ctx *cli.Context) error {
 	globalJSON = globalJSON || json
 	globalNoColor = globalNoColor || noColor || globalJSONLine
 	globalInsecure = globalInsecure || insecure
-	globalDevMode = globalDevMode || devMode
+	GlobalDevMode = GlobalDevMode || devMode
 	globalAirgapped = globalAirgapped || airgapped
 
 	// Disable colorified messages if requested.
@@ -151,5 +175,30 @@ func setGlobalsFromContext(ctx *cli.Context) error {
 		}
 	}
 
+	dnsEntries := ctx.StringSlice("resolve")
+	if len(dnsEntries) > 0 {
+		globalResolvers = make(map[string]netip.Addr, len(dnsEntries))
+
+		// Each entry is a HOST[:PORT]=IP pair. This is very similar to cURL's syntax.
+		for _, e := range dnsEntries {
+			i := strings.IndexByte(e, '=')
+			if i < 0 {
+				return fmt.Errorf("invalid DNS resolve entry %s", e)
+			}
+
+			if strings.ContainsRune(e[:i], ':') {
+				if _, _, err := net.SplitHostPort(e[:i]); err != nil {
+					return fmt.Errorf("invalid DNS resolve entry %s: %v", e, err)
+				}
+			}
+
+			host := e[:i]
+			addr, err := netip.ParseAddr(e[i+1:])
+			if err != nil {
+				return fmt.Errorf("invalid DNS resolve entry %s: %v", e, err)
+			}
+			globalResolvers[host] = addr
+		}
+	}
 	return nil
 }

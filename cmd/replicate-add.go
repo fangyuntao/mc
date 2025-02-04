@@ -34,7 +34,7 @@ import (
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/replication"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var replicateAddFlags = []cli.Flag{
@@ -83,7 +83,7 @@ var replicateAddFlags = []cli.Flag{
 	},
 	cli.StringFlag{
 		Name:  "bandwidth",
-		Usage: "set bandwidth limit in bits per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
+		Usage: "set bandwidth limit in bytes per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
 	},
 	cli.BoolFlag{
 		Name:  "sync",
@@ -117,22 +117,26 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Add replication configuration rule on bucket "mybucket" for alias "myminio" to replicate all operations in an active-active replication setup.
+  1. Add replication configuration rule on bucket "sourcebucket" for alias "sourceminio" with alias "targetminio" to replicate all operations in an active-active replication setup.
+     {{.Prompt}} {{.HelpName}} sourceminio/sourcebucket --remote-bucket targetminio/targetbucket \
+         --priority 1 
+
+  2. Add replication configuration rule on bucket "mybucket" for alias "myminio" to replicate all operations in an active-active replication setup.
      {{.Prompt}} {{.HelpName}} myminio/mybucket --remote-bucket https://foobar:foo12345@minio.siteb.example.com/targetbucket \
          --priority 1 
 
-  2. Add replication configuration rule on bucket "mybucket" for alias "myminio" to replicate all objects with tags
+  3. Add replication configuration rule on bucket "mybucket" for alias "myminio" to replicate all objects with tags
      "key1=value1, key2=value2" to targetbucket synchronously with bandwidth set to 2 gigabits per second. 
      {{.Prompt}} {{.HelpName}} myminio/mybucket --remote-bucket https://foobar:foo12345@minio.siteb.example.com/targetbucket  \
          --tags "key1=value1&key2=value2" --bandwidth "2G" --sync \
          --priority 1
 
-  3. Disable a replication configuration rule on bucket "mybucket" for alias "myminio".
+  4. Disable a replication configuration rule on bucket "mybucket" for alias "myminio".
      {{.Prompt}} {{.HelpName}} myminio/mybucket --remote-bucket https://foobar:foo12345@minio.siteb.example.com/targetbucket  \
          --tags "key1=value1&key2=value2" \
          --priority 1 --disable
 
-  4. Add replication configuration rule with existing object replication, delete marker replication and versioned deletes
+  5. Add replication configuration rule with existing object replication, delete marker replication and versioned deletes
      enabled on bucket "mybucket" for alias "myminio".
      {{.Prompt}} {{.HelpName}} myminio/mybucket --remote-bucket https://foobar:foo12345@minio.siteb.example.com/targetbucket  \
          --replicate "existing-objects,delete,delete-marker" \
@@ -178,17 +182,29 @@ func (l replicateAddMessage) String() string {
 
 func extractCredentialURL(argURL string) (accessKey, secretKey string, u *url.URL) {
 	var parsedURL string
-	if hostKeyTokens.MatchString(argURL) {
-		fatalIf(errInvalidArgument().Trace(argURL), "temporary tokens are not allowed for remote targets")
-	}
-	if hostKeys.MatchString(argURL) {
-		parts := hostKeys.FindStringSubmatch(argURL)
-		if len(parts) != 5 {
-			fatalIf(errInvalidArgument().Trace(argURL), "unsupported remote target format, please check --help")
+	if strings.HasPrefix(argURL, "http://") || strings.HasPrefix(argURL, "https://") {
+		if hostKeyTokens.MatchString(argURL) {
+			fatalIf(errInvalidArgument().Trace(argURL), "temporary tokens are not allowed for remote targets")
 		}
-		accessKey = parts[2]
-		secretKey = parts[3]
-		parsedURL = fmt.Sprintf("%s%s", parts[1], parts[4])
+		if hostKeys.MatchString(argURL) {
+			parts := hostKeys.FindStringSubmatch(argURL)
+			if len(parts) != 5 {
+				fatalIf(errInvalidArgument().Trace(argURL), "unsupported remote target format, please check --help")
+			}
+			accessKey = parts[2]
+			secretKey = parts[3]
+			parsedURL = fmt.Sprintf("%s%s", parts[1], parts[4])
+		}
+	} else {
+		var alias string
+		var aliasCfg *aliasConfigV10
+		// get alias config by alias url
+		alias, parsedURL, aliasCfg = mustExpandAlias(argURL)
+		if aliasCfg == nil {
+			fatalIf(errInvalidAliasedURL(alias).Trace(argURL), "No such alias `"+alias+"` found.")
+			return
+		}
+		accessKey, secretKey = aliasCfg.AccessKey, aliasCfg.SecretKey
 	}
 	var e error
 	if parsedURL == "" {
@@ -251,7 +267,6 @@ func getBandwidthInBytes(bandwidthStr string) (bandwidth uint64, err error) {
 		if err != nil {
 			return
 		}
-		bandwidth = bandwidth / 8
 	}
 	return
 }

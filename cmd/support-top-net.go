@@ -34,6 +34,11 @@ var supportTopNetFlags = []cli.Flag{
 		Usage: "interval between requests in seconds",
 		Value: 1,
 	},
+	cli.IntFlag{
+		Name:  "n",
+		Usage: "number of requests to run before exiting. 0 for endless (default)",
+		Value: 0,
+	},
 }
 
 var supportTopNetCmd = cli.Command{
@@ -84,51 +89,45 @@ func mainSupportTopNet(ctx *cli.Context) error {
 
 	ctxt, cancel := context.WithCancel(globalContext)
 	defer cancel()
-	info, e := client.ServerInfo(ctxt)
-	fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to initialize admin client.")
-	hosts := make([]string, 0, len(info.Servers))
-	for _, s := range info.Servers {
-		hosts = append(hosts, s.Endpoint)
-	}
+
 	// MetricsOptions are options provided to Metrics call.
 	opts := madmin.MetricsOptions{
 		Type:     madmin.MetricNet,
 		Interval: time.Duration(ctx.Int("interval")) * time.Second,
+		N:        ctx.Int("n"),
 		ByHost:   true,
-		Hosts:    hosts,
 	}
-
+	if globalJSON {
+		e := client.Metrics(ctxt, opts, func(metrics madmin.RealtimeMetrics) {
+			printMsg(metricsMessage{RealtimeMetrics: metrics})
+		})
+		if e != nil && !errors.Is(e, context.Canceled) {
+			fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to fetch net metrics")
+		}
+		return nil
+	}
 	p := tea.NewProgram(initTopNetUI())
 	go func() {
-		if globalJSON {
-			e := client.Metrics(ctxt, opts, func(metrics madmin.RealtimeMetrics) {
-				printMsg(metricsMessage{RealtimeMetrics: metrics})
-			})
-			if e != nil && !errors.Is(e, context.Canceled) {
-				fatalIf(probe.NewError(e).Trace(aliasedURL), "Unable to fetch scanner metrics")
-			}
-		} else {
-			out := func(m madmin.RealtimeMetrics) {
-				for endPoint, metric := range m.ByHost {
-					if metric.Net != nil {
-						p.Send(topNetResult{
-							endPoint: endPoint,
-							stats:    *metric.Net,
-						})
-					}
-				}
-				if len(m.Errors) != 0 && len(m.Hosts) != 0 {
+		out := func(m madmin.RealtimeMetrics) {
+			for endPoint, metric := range m.ByHost {
+				if metric.Net != nil {
 					p.Send(topNetResult{
-						endPoint: m.Hosts[0],
-						error:    m.Errors[0],
+						endPoint: endPoint,
+						stats:    *metric.Net,
 					})
 				}
 			}
-
-			e := client.Metrics(ctxt, opts, out)
-			if e != nil {
-				fatalIf(probe.NewError(e), "Unable to fetch top net events")
+			if len(m.Errors) != 0 && len(m.Hosts) != 0 {
+				p.Send(topNetResult{
+					endPoint: m.Hosts[0],
+					error:    m.Errors[0],
+				})
 			}
+		}
+
+		e := client.Metrics(ctxt, opts, out)
+		if e != nil {
+			fatalIf(probe.NewError(e), "Unable to fetch top net events")
 		}
 		p.Quit()
 	}()

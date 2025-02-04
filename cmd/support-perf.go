@@ -30,7 +30,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var supportPerfFlags = append([]cli.Flag{
@@ -461,7 +461,7 @@ func convertPerfResults(results []PerfTestResult) PerfTestOutput {
 }
 
 func execSupportPerf(ctx *cli.Context, aliasedURL, perfType string) {
-	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true, true)
+	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true)
 	if len(apiKey) == 0 {
 		// api key not passed as flag. Check that the cluster is registered.
 		apiKey = validateClusterRegistered(alias, true)
@@ -480,7 +480,7 @@ func execSupportPerf(ctx *cli.Context, aliasedURL, perfType string) {
 		resultFileNamePfx := fmt.Sprintf("%s-perf_%s", filepath.Clean(alias), UTCNow().Format("20060102150405"))
 		resultFileName := resultFileNamePfx + ".json"
 
-		regInfo := getClusterRegInfo(getAdminInfo(aliasedURL), alias)
+		regInfo := GetClusterRegInfo(getAdminInfo(aliasedURL), alias)
 		tmpFileName, e := zipPerfResult(convertPerfResults(results), resultFileName, regInfo)
 		fatalIf(probe.NewError(e), "Unable to generate zip file from performance results")
 
@@ -490,10 +490,16 @@ func execSupportPerf(ctx *cli.Context, aliasedURL, perfType string) {
 			return
 		}
 
-		uploadURL := subnetUploadURL("perf", tmpFileName)
+		uploadURL := SubnetUploadURL("perf")
 		reqURL, headers := prepareSubnetUploadURL(uploadURL, alias, apiKey)
 
-		_, e = uploadFileToSubnet(alias, tmpFileName, reqURL, headers)
+		_, e = (&SubnetFileUploader{
+			alias:             alias,
+			FilePath:          tmpFileName,
+			ReqURL:            reqURL,
+			Headers:           headers,
+			DeleteAfterUpload: true,
+		}).UploadFileToSubnet()
 		if e != nil {
 			errorIf(probe.NewError(e), "Unable to upload performance results to SUBNET portal")
 			savePerfResultFile(tmpFileName, resultFileNamePfx)

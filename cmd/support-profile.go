@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -27,7 +28,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // profile command flags.
@@ -47,6 +48,36 @@ var (
 )
 
 const profileFile = "profile.zip"
+
+type supportProfileMessage struct {
+	Status string `json:"status"`
+	File   string `json:"file,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+// Colorized message for console printing.
+func (s supportProfileMessage) String() string {
+	var msg string
+	if s.Error != "" {
+		errMsg := fmt.Sprintln("Unable to upload profile file to SUBNET: ", s.Error)
+		msg := console.Colorize(supportErrorMsgTag, errMsg)
+		infoMsg := fmt.Sprintf("Profiling data saved locally at '%s'", profileFile)
+		msg += console.Colorize(supportSuccessMsgTag, infoMsg)
+		return msg
+	}
+
+	if globalAirgapped {
+		msg = fmt.Sprintf("Profiling data saved successfully at %s", s.File)
+	} else {
+		msg = "Profiling data uploaded to SUBNET successfully"
+	}
+	return console.Colorize(supportSuccessMsgTag, msg)
+}
+
+// JSON jsonified proxy remove message
+func (s supportProfileMessage) JSON() string {
+	return toJSON(s)
+}
 
 var supportProfileCmd = cli.Command{
 	Name:            "profile",
@@ -88,7 +119,9 @@ func checkAdminProfileSyntax(ctx *cli.Context) {
 		string(madmin.ProfilerTrace),
 		string(madmin.ProfilerThreads),
 		string(madmin.ProfilerGoroutines),
-		string(madmin.ProfilerCPUIO))
+		string(madmin.ProfilerCPUIO),
+		string(madmin.ProfilerRuntime),
+	)
 	// Check if the provided profiler type is known and supported
 	profilers := strings.Split(strings.ToLower(ctx.String("type")), ",")
 	for _, profiler := range profilers {
@@ -103,8 +136,8 @@ func checkAdminProfileSyntax(ctx *cli.Context) {
 		showCommandHelpAndExit(ctx, 1) // last argument is exit code
 	}
 
-	if ctx.Int("duration") < 10 {
-		fatal(errDummy().Trace(), "profiling must be run for atleast 10 seconds")
+	if ctx.Int("duration") < 1 {
+		fatal(errDummy().Trace(), "for any useful profiling one must run it for at least 1 second")
 	}
 }
 
@@ -167,9 +200,12 @@ func mainSupportProfile(ctx *cli.Context) error {
 	// Check for command syntax
 	checkAdminProfileSyntax(ctx)
 
+	setSuccessMessageColor()
+	setErrorMessageColor()
+
 	// Get the alias parameter from cli
 	aliasedURL := ctx.Args().Get(0)
-	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true, true)
+	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true)
 	if len(apiKey) == 0 {
 		// api key not passed as flag. Check that the cluster is registered.
 		apiKey = validateClusterRegistered(alias, true)
@@ -192,25 +228,41 @@ func execSupportProfile(ctx *cli.Context, client *madmin.AdminClient, alias, api
 	if !globalAirgapped {
 		// Retrieve subnet credentials (login/license) beforehand as
 		// it can take a long time to fetch the profile data
-		uploadURL := subnetUploadURL("profile", profileFile)
+		uploadURL := SubnetUploadURL("profile")
 		reqURL, headers = prepareSubnetUploadURL(uploadURL, alias, apiKey)
 	}
 
-	console.Infof("Profiling '%s' for %d seconds... \n", alias, duration)
+	if !globalJSON {
+		console.Infof("Profiling '%s' for %d seconds... \n", alias, duration)
+	}
 	data, e := client.Profile(globalContext, madmin.ProfilerType(profilers), time.Second*time.Duration(duration))
 	fatalIf(probe.NewError(e), "Unable to save profile data")
 
 	saveProfileFile(data)
 
 	if !globalAirgapped {
-		_, e = uploadFileToSubnet(alias, profileFile, reqURL, headers)
+		_, e = (&SubnetFileUploader{
+			alias:             alias,
+			FilePath:          profileFile,
+			ReqURL:            reqURL,
+			Headers:           headers,
+			DeleteAfterUpload: true,
+		}).UploadFileToSubnet()
 		if e != nil {
-			errorIf(probe.NewError(e), "Unable to upload profile file to SUBNET")
-			console.Infof("Profiling data saved locally at '%s'\n", profileFile)
+			printMsg(supportProfileMessage{
+				Status: "error",
+				Error:  e.Error(),
+				File:   profileFile,
+			})
 			return
 		}
-		console.Infoln("Profiling data uploaded to SUBNET successfully")
+		printMsg(supportProfileMessage{
+			Status: "success",
+		})
 	} else {
-		console.Infoln("Profiling data saved successfully at", profileFile)
+		printMsg(supportProfileMessage{
+			Status: "success",
+			File:   profileFile,
+		})
 	}
 }
