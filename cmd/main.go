@@ -35,12 +35,13 @@ import (
 
 	"github.com/inconshreveable/mousetrap"
 	"github.com/minio/cli"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v2/console"
-	"github.com/minio/pkg/v2/env"
-	"github.com/minio/pkg/v2/trie"
-	"github.com/minio/pkg/v2/words"
+	"github.com/minio/pkg/v3/console"
+	"github.com/minio/pkg/v3/env"
+	"github.com/minio/pkg/v3/trie"
+	"github.com/minio/pkg/v3/words"
 	"golang.org/x/term"
 
 	completeinstall "github.com/posener/complete/cmd/install"
@@ -117,7 +118,7 @@ func Main(args []string) error {
 
 	// Fetch terminal size, if not available, automatically
 	// set globalQuiet to true on non-window.
-	if w, h, e := term.GetSize(int(os.Stdin.Fd())); e != nil {
+	if w, h, e := term.GetSize(int(os.Stdout.Fd())); e != nil {
 		globalQuiet = runtime.GOOS != "windows"
 	} else {
 		globalTermWidth, globalTermHeight = w, h
@@ -137,6 +138,7 @@ func Main(args []string) error {
 	// Wait until the user quits the pager
 	defer globalHelpPager.WaitForExit()
 
+	parsePagerDisableFlag(args)
 	// Run the app
 	return registerApp(appName).Run(args)
 }
@@ -255,9 +257,6 @@ func migrate() {
 	// Migrate config files if any.
 	migrateConfig()
 
-	// Migrate session files if any.
-	migrateSession()
-
 	// Migrate shared urls if any.
 	migrateShare()
 }
@@ -272,11 +271,6 @@ func initMC() {
 		if !globalQuiet && !globalJSON {
 			console.Infoln("Configuration written to `" + mustGetMcConfigPath() + "`. Please update your access credentials.")
 		}
-	}
-
-	// Check if mc session directory exists.
-	if !isSessionDirExists() {
-		fatalIf(createSessionDir().Trace(), "Unable to create session config directory.")
 	}
 
 	// Check if mc share directory exists.
@@ -359,6 +353,8 @@ func installAutoCompletion() {
 }
 
 func registerBefore(ctx *cli.Context) error {
+	deprecatedFlagsWarning(ctx)
+
 	if ctx.IsSet("config-dir") {
 		// Set the config directory.
 		setMcConfigDir(ctx.String("config-dir"))
@@ -402,7 +398,7 @@ func findClosestCommands(commandsTree *trie.Trie, command string) []string {
 // Check for updates and print a notification message
 func checkUpdate(ctx *cli.Context) {
 	// Do not print update messages, if quiet flag is set.
-	if ctx.Bool("quiet") || ctx.GlobalBool("quiet") {
+	if !ctx.Bool("quiet") && !ctx.GlobalBool("quiet") {
 		// Its OK to ignore any errors during doUpdate() here.
 		if updateMsg, _, currentReleaseTime, latestReleaseTime, _, err := getUpdateInfo("", 2*time.Second); err == nil {
 			printMsg(updateMessage{
@@ -420,46 +416,49 @@ func checkUpdate(ctx *cli.Context) {
 
 var appCmds = []cli.Command{
 	aliasCmd,
-	lsCmd,
-	mbCmd,
-	rbCmd,
+	adminCmd,
+	anonymousCmd,
+	batchCmd,
 	cpCmd,
-	mvCmd,
-	rmCmd,
-	mirrorCmd,
 	catCmd,
-	headCmd,
-	pipeCmd,
-	findCmd,
-	sqlCmd,
-	statCmd,
-	treeCmd,
+	configCmd,
+	corsCmd,
+	diffCmd,
 	duCmd,
-	retentionCmd,
-	legalHoldCmd,
-	supportCmd,
-	licenseCmd,
-	shareCmd,
-	versionCmd,
-	ilmCmd,
-	quotaCmd,
 	encryptCmd,
 	eventCmd,
-	watchCmd,
-	undoCmd,
-	anonymousCmd,
-	policyCmd,
-	tagCmd,
-	diffCmd,
-	replicateCmd,
-	adminCmd,
+	findCmd,
+	getCmd,
+	headCmd,
+	ilmCmd,
 	idpCmd,
-	configCmd,
-	updateCmd,
-	readyCmd,
-	pingCmd,
+	licenseCmd,
+	legalHoldCmd,
+	lsCmd,
+	mbCmd,
+	mvCmd,
+	mirrorCmd,
 	odCmd,
-	batchCmd,
+	pingCmd,
+	policyCmd,
+	pipeCmd,
+	putCmd,
+	quotaCmd,
+	rmCmd,
+	retentionCmd,
+	rbCmd,
+	replicateCmd,
+	readyCmd,
+	sqlCmd,
+	statCmd,
+	supportCmd,
+	shareCmd,
+	treeCmd,
+	tagCmd,
+	undoCmd,
+	updateCmd,
+	versionCmd,
+	watchCmd,
 }
 
 func printMCVersion(c *cli.Context) {
@@ -481,7 +480,10 @@ func registerApp(name string) *cli.App {
 	app := cli.NewApp()
 	app.Name = name
 	app.Action = func(ctx *cli.Context) error {
-		if strings.HasPrefix(ReleaseTag, "RELEASE.") {
+		mcEnable := env.Get("MC_UPDATE", madmin.EnableOn)
+		minioEnable := env.Get("MINIO_UPDATE", madmin.EnableOn)
+
+		if strings.HasPrefix(ReleaseTag, "RELEASE.") && (mcEnable == madmin.EnableOn || minioEnable == madmin.EnableOn) {
 			// Check for new updates from dl.min.io.
 			checkUpdate(ctx)
 		}
@@ -510,8 +512,22 @@ func registerApp(name string) *cli.App {
 	app.CustomAppHelpTemplate = mcHelpTemplate
 	app.EnableBashCompletion = true
 	app.OnUsageError = onUsageError
-	if isTerminal() {
+	app.After = func(*cli.Context) error {
+		globalExpiringCerts.Range(func(k, v interface{}) bool {
+			host := k.(string)
+			expires := v.(time.Time)
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "== WARN: `%s` certificate will expire in %s. Renew soon to avoid outage.\n", host, expires)
+			fmt.Fprintf(os.Stderr, "\n")
+			return true
+		})
+		return nil
+	}
+
+	if isTerminal() && !globalPagerDisabled {
 		app.HelpWriter = globalHelpPager
+	} else {
+		app.HelpWriter = os.Stdout
 	}
 
 	return app

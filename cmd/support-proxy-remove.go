@@ -20,7 +20,7 @@ package cmd
 import (
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 type supportProxyRemoveMessage struct {
@@ -44,7 +44,7 @@ var supportProxyRemoveCmd = cli.Command{
 	Action:          mainSupportProxyRemove,
 	OnUsageError:    onUsageError,
 	Before:          setGlobalsFromContext,
-	Flags:           supportGlobalFlags,
+	Flags:           globalFlags,
 	HideHelpCommand: true,
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}

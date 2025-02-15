@@ -25,7 +25,7 @@ import (
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var licenseUpdateCmd = cli.Command{
@@ -106,9 +106,9 @@ func performLicenseRenew(alias string) licUpdateMessage {
 	}
 
 	renewURL := subnetLicenseRenewURL()
-	headers := subnetAPIKeyAuthHeaders(apiKey)
+	headers := SubnetAPIKeyAuthHeaders(apiKey)
 	headers.addDeploymentIDHeader(alias)
-	resp, e := subnetPostReq(renewURL, nil, headers)
+	resp, e := SubnetPostReq(renewURL, nil, headers)
 	fatalIf(probe.NewError(e), "Error renewing license for %s", alias)
 
 	extractAndSaveSubnetCreds(alias, resp)

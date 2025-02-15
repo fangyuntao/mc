@@ -32,6 +32,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/pkg/xattr"
 	"github.com/rjeczalik/notify"
 
@@ -40,11 +42,12 @@ import (
 	"github.com/minio/mc/pkg/hookreader"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/cors"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"github.com/minio/minio-go/v7/pkg/notification"
 	"github.com/minio/minio-go/v7/pkg/replication"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // filesystem client
@@ -300,8 +303,12 @@ func (f *fsClient) put(_ context.Context, reader io.Reader, size int64, progress
 
 	objectPath := f.PathURL.Path
 
-	// Write to a temporary file "object.part.minio" before commit.
-	objectPartPath := objectPath + partSuffix
+	if err := checkPathLength(objectPath); err != nil {
+		return 0, err
+	}
+
+	// Write to a temporary file "objectpath/uuid" before commit.
+	objectPartPath := filepath.Join(filepath.Dir(objectPath), uuid.NewString())
 
 	// We cannot resume this operation, then we
 	// should remove any partial download if any.
@@ -392,6 +399,49 @@ func (f *fsClient) Put(ctx context.Context, reader io.Reader, size int64, progre
 	return f.put(ctx, reader, size, progress, opts)
 }
 
+// checkPathLength - returns error if given path name length more than 255
+func checkPathLength(pathName string) *probe.Error {
+	// Apple OS X path length is limited to 1016
+	if runtime.GOOS == "darwin" && len(pathName) > 1016 {
+		return probe.NewError(errors.New("file name too long"))
+	}
+
+	// Disallow more than 32,767 characters on windows, there
+	// are no known name_max limits on Windows.
+	// Refer: https://learn.microsoft.com/en-us/windows/win32/fileio/maximum-file-path-limitation?tabs=registry
+	if runtime.GOOS == "windows" && len(pathName) > 32767 {
+		return probe.NewError(errors.New("file name too long"))
+	}
+
+	// On Unix we reject paths if they are just '.', '..' or '/'
+	if pathName == "." || pathName == ".." || pathName == "/" {
+		return probe.NewError(errors.New("file access denied"))
+	}
+
+	// Check each path segment length is > 255 on all Unix
+	// platforms, look for this value as NAME_MAX in
+	// /usr/include/linux/limits.h
+	var count int64
+	for _, p := range pathName {
+		switch p {
+		case '/':
+			count = 0 // Reset
+		case '\\':
+			if runtime.GOOS == "windows" {
+				count = 0
+			} else {
+				count++
+			}
+		default:
+			count++
+		}
+		if count > 255 {
+			return probe.NewError(errors.New("file name too long"))
+		}
+	} // Success.
+	return nil
+}
+
 func (f *fsClient) putN(_ context.Context, reader io.Reader, size int64, progress io.Reader, opts PutOptions) (int64, *probe.Error) {
 	// ContentType is not handled on purpose.
 	// For filesystem this is a redundant information.
@@ -414,8 +464,12 @@ func (f *fsClient) putN(_ context.Context, reader io.Reader, size int64, progres
 
 	objectPath := f.PathURL.Path
 
-	// Write to a temporary file "object.part.minio" before commit.
-	objectPartPath := objectPath + partSuffix
+	if err := checkPathLength(objectPath); err != nil {
+		return 0, err
+	}
+
+	// Write to a temporary file ""objectpath/uuid"" before commit.
+	objectPartPath := filepath.Join(filepath.Dir(objectPath), uuid.NewString())
 
 	// We cannot resume this operation, then we
 	// should remove any partial download if any.
@@ -540,21 +594,53 @@ func (f *fsClient) Copy(ctx context.Context, source string, opts CopyOptions, pr
 }
 
 // Get returns reader and any additional metadata.
-func (f *fsClient) Get(_ context.Context, opts GetOptions) (io.ReadCloser, *probe.Error) {
+func (f *fsClient) Get(_ context.Context, opts GetOptions) (io.ReadCloser, *ClientContent, *probe.Error) {
 	fileData, e := os.Open(f.PathURL.Path)
 	if e != nil {
 		err := f.toClientError(e, f.PathURL.Path)
-		return nil, err.Trace(f.PathURL.Path)
+		return nil, nil, err.Trace(f.PathURL.Path)
 	}
 	if opts.RangeStart != 0 {
 		_, e := fileData.Seek(opts.RangeStart, io.SeekStart)
 		if e != nil {
 			err := f.toClientError(e, f.PathURL.Path)
-			return nil, err.Trace(f.PathURL.Path)
+			return nil, nil, err.Trace(f.PathURL.Path)
 		}
 	}
 
-	return fileData, nil
+	fi, e := fileData.Stat()
+	if e != nil {
+		return nil, nil, probe.NewError(e)
+	}
+
+	content := &ClientContent{}
+	content.URL = *f.PathURL
+	content.Size = fi.Size()
+	content.Time = fi.ModTime()
+	content.Type = fi.Mode()
+	content.Metadata = map[string]string{
+		"Content-Type": guessURLContentType(f.PathURL.Path),
+	}
+
+	path := f.PathURL.String()
+	// Populates meta data with file system attribute only in case of
+	// when preserve flag is passed.
+	if opts.Preserve {
+		fileAttr, err := disk.GetFileSystemAttrs(path)
+		if err != nil {
+			return nil, content, nil
+		}
+		metaData, pErr := getAllXattrs(path)
+		if pErr != nil {
+			return nil, content, nil
+		}
+		for k, v := range metaData {
+			content.Metadata[k] = v
+		}
+		content.Metadata[metadataKey] = fileAttr
+	}
+
+	return fileData, content, nil
 }
 
 // Check if the given error corresponds to ENOTEMPTY for unix
@@ -1472,6 +1558,30 @@ func (f *fsClient) Restore(_ context.Context, _ string, _ int) *probe.Error {
 func (f *fsClient) GetPart(_ context.Context, _ int) (io.ReadCloser, *probe.Error) {
 	return nil, probe.NewError(APINotImplemented{
 		API:     "GetPart",
+		APIType: "filesystem",
+	})
+}
+
+// GetBucketCors - not implemented
+func (f *fsClient) GetBucketCors(_ context.Context) (*cors.Config, *probe.Error) {
+	return nil, probe.NewError(APINotImplemented{
+		API:     "GetBucketCors",
+		APIType: "filesystem",
+	})
+}
+
+// SetBucketCors - not implemented
+func (f *fsClient) SetBucketCors(_ context.Context, _ []byte) *probe.Error {
+	return probe.NewError(APINotImplemented{
+		API:     "SetBucketCors",
+		APIType: "filesystem",
+	})
+}
+
+// DeleteBucketCors - not implemented
+func (f *fsClient) DeleteBucketCors(_ context.Context) *probe.Error {
+	return probe.NewError(APINotImplemented{
+		API:     "DeleteBucketCors",
 		APIType: "filesystem",
 	})
 }

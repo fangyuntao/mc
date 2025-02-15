@@ -29,7 +29,7 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 const (
@@ -220,7 +220,7 @@ func mainLicenseRegister(ctx *cli.Context) error {
 		alias, _ = url2Alias(aliasedURL)
 		accAPIKey = validateAndSaveLic(string(licBytes), alias, true)
 	} else {
-		alias, accAPIKey = initSubnetConnectivity(ctx, aliasedURL, true, false)
+		alias, accAPIKey = initSubnetConnectivity(ctx, aliasedURL, false)
 	}
 
 	clusterName := ctx.String("name")
@@ -232,7 +232,7 @@ func mainLicenseRegister(ctx *cli.Context) error {
 		}
 	}
 
-	regInfo := getClusterRegInfo(getAdminInfo(aliasedURL), clusterName)
+	regInfo := GetClusterRegInfo(getAdminInfo(aliasedURL), clusterName)
 
 	lrm := licRegisterMessage{Status: "success", Alias: alias}
 	if !globalAirgapped {

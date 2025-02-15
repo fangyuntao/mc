@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"github.com/minio/mc/pkg/probe"
+	"github.com/minio/minio-go/v7"
 )
 
 // URLs contains source and target urls
@@ -31,6 +32,7 @@ type URLs struct {
 	TotalSize        int64
 	MD5              bool
 	DisableMultipart bool
+	checksum         minio.ChecksumType
 	encKeyDB         map[string][]prefixSSEPair
 	Error            *probe.Error `json:"-"`
 	ErrorCond        differType   `json:"-"`
@@ -48,7 +50,7 @@ func (m URLs) Equal(n URLs) bool {
 		return false
 	} else if m.SourceContent == nil && n.SourceContent != nil {
 		return false
-	} else if m.SourceContent.URL != n.SourceContent.URL {
+	} else if m.SourceContent != nil && n.SourceContent != nil && m.SourceContent.URL != n.SourceContent.URL {
 		return false
 	}
 
@@ -56,7 +58,7 @@ func (m URLs) Equal(n URLs) bool {
 		return false
 	} else if m.TargetContent == nil && n.TargetContent != nil {
 		return false
-	} else if m.TargetContent.URL != n.TargetContent.URL {
+	} else if m.TargetContent != nil && n.TargetContent != nil && m.TargetContent.URL != n.TargetContent.URL {
 		return false
 	}
 

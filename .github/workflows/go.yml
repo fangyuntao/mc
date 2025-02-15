@@ -3,7 +3,7 @@ name: Go
 on:
   pull_request:
     branches:
-    - master
+      - master
 
 # This ensures that previous jobs for the PR are canceled when the PR is
 # updated.
@@ -19,17 +19,17 @@ jobs:
       GO111MODULE: on
     strategy:
       matrix:
-        go-version: [1.21.x]
+        go-version: [1.23.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Set up Go ${{ matrix.go-version }} on ${{ matrix.os }}
-        uses: actions/setup-go@v1
+        uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go-version }}
         id: go
 
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v1
+        uses: actions/checkout@v4
 
       - name: Build on ${{ matrix.os }}
         if: matrix.os == 'windows-latest'
@@ -49,6 +49,9 @@ jobs:
           ENABLE_HTTPS: 1
           MINIO_CI_CD: 1
           SERVER_ENDPOINT: localhost:9000
+          MC_TEST_ENABLE_HTTPS: true
+          MC_TEST_SKIP_INSECURE: true
+          MC_TEST_SKIP_BUILD: true
         run: |
           wget https://dl.min.io/server/minio/release/linux-amd64/minio && chmod +x minio
           mkdir -p ~/.minio/certs/ && cp testdata/localhost.crt ~/.minio/certs/public.crt && cp testdata/localhost.key ~/.minio/certs/private.key
@@ -57,7 +60,7 @@ jobs:
           make
           make test-race
           make verify
-          make crosscompile
+          ./functional-tests.sh
   vetchecks: # Run vet checks against one version.
     env:
       CGO_ENABLED: 0
@@ -66,7 +69,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v2
         with:
-          go-version: 1.21.x
+          go-version: 1.23.x
 
       - name: Checkout code
         uses: actions/checkout@v2
@@ -76,4 +79,4 @@ jobs:
 
       - name: Staticcheck
         # Run with defaults, but allow errors with other formats ST1005
-        run: go install honnef.co/go/tools/cmd/staticcheck@latest && staticcheck -tests=false -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-ST1023,-ST1005" ./...
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest && make lint

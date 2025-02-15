@@ -32,7 +32,7 @@ import (
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/replication"
 	"github.com/minio/minio-go/v7/pkg/s3utils"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var replicateUpdateFlags = []cli.Flag{
@@ -76,7 +76,7 @@ var replicateUpdateFlags = []cli.Flag{
 	},
 	cli.StringFlag{
 		Name:  "bandwidth",
-		Usage: "Set bandwidth limit in bits per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
+		Usage: "Set bandwidth limit in bytes per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
 	},
 	cli.UintFlag{
 		Name:  "healthcheck-seconds",
@@ -132,8 +132,11 @@ EXAMPLES:
 
   8. Edit credentials for remote target with replication rule ID kxYD.491
      {{.Prompt}} {{.HelpName}} myminio/mybucket --id "kxYD.491" --remote-bucket  https://foobar:newpassword@minio.siteb.example.com/targetbucket
+  
+  9. Edit credentials with alias "targetminio" for remote target with replication rule ID kxYD.491
+     {{.Prompt}} {{.HelpName}} myminio/mybucket --id "kxYD.491" --remote-bucket  targetminio/targetbucket
 
-  9. Disable proxying and enable synchronous replication for remote target of bucket mybucket with rule ID kxYD.492
+  10. Disable proxying and enable synchronous replication for remote target of bucket mybucket with rule ID kxYD.492
      {{.Prompt}} {{.HelpName}} myminio/mybucket --id "kxYD.492" --remote-bucket https://foobar:newpassword@minio.siteb.example.com/targetbucket \
          --sync "enable" --proxy "disable"
 `,

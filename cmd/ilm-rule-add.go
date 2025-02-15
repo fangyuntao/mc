@@ -26,7 +26,7 @@ import (
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var ilmAddCmd = cli.Command{
@@ -181,6 +181,10 @@ var ilmAddFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "noncurrent-transition-tier",
 		Usage: "remote tier name to transition",
+	},
+	cli.BoolFlag{
+		Name:  "expire-all-object-versions",
+		Usage: "expire all object versions",
 	},
 }
 

@@ -18,13 +18,13 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	gojson "encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +37,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
-	"github.com/tidwall/gjson"
+	"github.com/minio/pkg/v3/console"
 )
 
 const (
@@ -96,6 +95,21 @@ EXAMPLES:
 `,
 }
 
+type supportDiagMessage struct {
+	Status string `json:"status"`
+}
+
+// String colorized status message
+func (s supportDiagMessage) String() string {
+	return console.Colorize(supportSuccessMsgTag, "MinIO diagnostics report was successfully uploaded to SUBNET.")
+}
+
+// JSON jsonified status message
+func (s supportDiagMessage) JSON() string {
+	s.Status = "success"
+	return toJSON(s)
+}
+
 // checkSupportDiagSyntax - validate arguments passed by a user
 func checkSupportDiagSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) == 0 || len(ctx.Args()) > 1 {
@@ -110,26 +124,13 @@ func checkSupportDiagSyntax(ctx *cli.Context) {
 
 // compress and tar MinIO diagnostics output
 func tarGZ(healthInfo interface{}, version, filename string) error {
-	f, e := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0o666)
+	data, e := TarGZHealthInfo(healthInfo, version)
 	if e != nil {
 		return e
 	}
-	defer f.Close()
 
-	gzWriter := gzip.NewWriter(f)
-	defer gzWriter.Close()
-
-	enc := gojson.NewEncoder(gzWriter)
-
-	header := struct {
-		Version string `json:"version"`
-	}{Version: version}
-
-	if e := enc.Encode(header); e != nil {
-		return e
-	}
-
-	if e := enc.Encode(healthInfo); e != nil {
+	e = os.WriteFile(filename, data, 0o666)
+	if e != nil {
 		return e
 	}
 
@@ -146,6 +147,32 @@ func tarGZ(healthInfo interface{}, version, filename string) error {
 	}
 
 	return nil
+}
+
+// TarGZHealthInfo - compress and tar MinIO diagnostics output
+func TarGZHealthInfo(healthInfo interface{}, version string) ([]byte, error) {
+	buffer := bytes.NewBuffer(nil)
+	gzWriter := gzip.NewWriter(buffer)
+
+	enc := gojson.NewEncoder(gzWriter)
+
+	header := struct {
+		Version string `json:"version"`
+	}{Version: version}
+
+	if e := enc.Encode(header); e != nil {
+		return nil, e
+	}
+
+	if e := enc.Encode(healthInfo); e != nil {
+		return nil, e
+	}
+
+	if e := gzWriter.Close(); e != nil {
+		return nil, e
+	}
+
+	return buffer.Bytes(), nil
 }
 
 func infoText(s string) string {
@@ -168,7 +195,7 @@ func mainSupportDiag(ctx *cli.Context) error {
 
 	// Get the alias parameter from cli
 	aliasedURL := ctx.Args().Get(0)
-	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true, true)
+	alias, apiKey := initSubnetConnectivity(ctx, aliasedURL, true)
 	if len(apiKey) == 0 {
 		// api key not passed as flag. Check that the cluster is registered.
 		apiKey = validateClusterRegistered(alias, true)
@@ -186,19 +213,20 @@ func mainSupportDiag(ctx *cli.Context) error {
 func execSupportDiag(ctx *cli.Context, client *madmin.AdminClient, alias, apiKey string) {
 	var reqURL string
 	var headers map[string]string
+	setSuccessMessageColor()
 
 	filename := fmt.Sprintf("%s-health_%s.json.gz", filepath.Clean(alias), UTCNow().Format("20060102150405"))
 	if !globalAirgapped {
 		// Retrieve subnet credentials (login/license) beforehand as
 		// it can take a long time to fetch the health information
-		uploadURL := subnetUploadURL("health", filename)
+		uploadURL := SubnetUploadURL("health")
 		reqURL, headers = prepareSubnetUploadURL(uploadURL, alias, apiKey)
 	}
 
 	healthInfo, version, e := fetchServerDiagInfo(ctx, client)
 	fatalIf(probe.NewError(e), "Unable to fetch health information.")
 
-	if globalJSON {
+	if globalJSON && globalAirgapped {
 		switch version {
 		case madmin.HealthInfoVersion0:
 			printMsg(healthInfo.(madmin.HealthInfoV0))
@@ -214,15 +242,16 @@ func execSupportDiag(ctx *cli.Context, client *madmin.AdminClient, alias, apiKey
 	fatalIf(probe.NewError(e), "Unable to save MinIO diagnostics report")
 
 	if !globalAirgapped {
-		resp, e := uploadFileToSubnet(alias, filename, reqURL, headers)
+		_, e = (&SubnetFileUploader{
+			alias:             alias,
+			FilePath:          filename,
+			ReqURL:            reqURL,
+			Headers:           headers,
+			DeleteAfterUpload: true,
+		}).UploadFileToSubnet()
 		fatalIf(probe.NewError(e), "Unable to upload MinIO diagnostics report to SUBNET portal")
 
-		msg := "MinIO diagnostics report was successfully uploaded to SUBNET."
-		clusterURL, _ := url.PathUnescape(gjson.Get(resp, "cluster_url").String())
-		if len(clusterURL) > 0 {
-			msg += fmt.Sprintf(" Please click here to view our analysis: %s", clusterURL)
-		}
-		console.Infoln(msg)
+		printMsg(supportDiagMessage{})
 	}
 }
 

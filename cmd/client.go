@@ -19,16 +19,27 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
+	"github.com/klauspost/compress/gzhttp"
+	"github.com/minio/mc/pkg/httptracer"
+	"github.com/minio/mc/pkg/limiter"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/cors"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"github.com/minio/minio-go/v7/pkg/replication"
+	"github.com/minio/pkg/v3/env"
 )
 
 // DirOpt - list directory option.
@@ -49,6 +60,8 @@ type GetOptions struct {
 	VersionID  string
 	Zip        bool
 	RangeStart int64
+	PartNumber int
+	Preserve   bool
 }
 
 // PutOptions holds options for PUT operation
@@ -61,16 +74,27 @@ type PutOptions struct {
 	multipartSize         uint64
 	multipartThreads      uint
 	concurrentStream      bool
+	ifNotExists           bool
+	checksum              minio.ChecksumType
 }
 
 // StatOptions holds options of the HEAD operation
 type StatOptions struct {
-	incomplete bool
-	preserve   bool
-	sse        encrypt.ServerSide
-	timeRef    time.Time
-	versionID  string
-	isZip      bool
+	incomplete         bool
+	preserve           bool
+	sse                encrypt.ServerSide
+	timeRef            time.Time
+	versionID          string
+	includeVersions    bool
+	isZip              bool
+	ignoreBucketExists bool
+	headOnly           bool
+}
+
+// BucketStatOptions - bucket stat.
+type BucketStatOptions struct {
+	bucket             string
+	ignoreBucketExists bool
 }
 
 // ListOptions holds options for listing operation
@@ -113,8 +137,8 @@ type Client interface {
 	GetObjectLockConfig(ctx context.Context) (status string, mode minio.RetentionMode, validity uint64, unit minio.ValidityUnit, perr *probe.Error)
 
 	// Access policy operations.
-	GetAccess(ctx context.Context) (access, policyJSON string, error *probe.Error)
-	GetAccessRules(ctx context.Context) (policyRules map[string]string, error *probe.Error)
+	GetAccess(ctx context.Context) (access, policyJSON string, err *probe.Error)
+	GetAccessRules(ctx context.Context) (policyRules map[string]string, err *probe.Error)
 	SetAccess(ctx context.Context, access string, isJSON bool) *probe.Error
 
 	// I/O operations
@@ -124,7 +148,7 @@ type Client interface {
 	Select(ctx context.Context, expression string, sse encrypt.ServerSide, opts SelectObjectOpts) (io.ReadCloser, *probe.Error)
 
 	// I/O operations with metadata.
-	Get(ctx context.Context, opts GetOptions) (reader io.ReadCloser, err *probe.Error)
+	Get(ctx context.Context, opts GetOptions) (reader io.ReadCloser, content *ClientContent, err *probe.Error)
 	Put(ctx context.Context, reader io.Reader, size int64, progress io.Reader, opts PutOptions) (n int64, err *probe.Error)
 
 	// Object Locking related API
@@ -179,6 +203,11 @@ type Client interface {
 	// OD operations
 	GetPart(ctx context.Context, part int) (io.ReadCloser, *probe.Error)
 	PutPart(ctx context.Context, reader io.Reader, size int64, progress io.Reader, opts PutOptions) (n int64, err *probe.Error)
+
+	// Cors operations
+	GetBucketCors(ctx context.Context) (*cors.Config, *probe.Error)
+	SetBucketCors(ctx context.Context, corsXML []byte) *probe.Error
+	DeleteBucketCors(ctx context.Context) *probe.Error
 }
 
 // ClientContent - Content container for content metadata
@@ -192,6 +221,7 @@ type ClientContent struct {
 	Metadata     map[string]string
 	Tags         map[string]string
 	UserMetadata map[string]string
+	Checksum     map[string]string
 	ETag         string
 	Expires      time.Time
 
@@ -231,7 +261,145 @@ type Config struct {
 	ConnWriteDeadline time.Duration
 	UploadLimit       int64
 	DownloadLimit     int64
-	Transport         *http.Transport
+	Transport         http.RoundTripper
+}
+
+// getCredsChain returns an []credentials.Provider array for the config
+// and the STS configuration (if present)
+func (config *Config) getCredsChain() ([]credentials.Provider, *probe.Error) {
+	var credsChain []credentials.Provider
+	// if an STS endpoint is set, we will add that to the chain
+	if stsEndpoint := env.Get("MC_STS_ENDPOINT_"+config.Alias, ""); stsEndpoint != "" {
+		// set AWS_WEB_IDENTITY_TOKEN_FILE is MC_WEB_IDENTITY_TOKEN_FILE is set
+		if val := env.Get("MC_WEB_IDENTITY_TOKEN_FILE_"+config.Alias, ""); val != "" {
+			os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", val)
+			if val := env.Get("MC_ROLE_ARN_"+config.Alias, ""); val != "" {
+				os.Setenv("AWS_ROLE_ARN", val)
+			}
+			if val := env.Get("MC_ROLE_SESSION_NAME_"+config.Alias, randString(32, rand.NewSource(time.Now().UnixNano()), "mc-session-name-")); val != "" {
+				os.Setenv("AWS_ROLE_SESSION_NAME", val)
+			}
+		}
+		stsEndpointURL, err := url.Parse(stsEndpoint)
+		if err != nil {
+			return nil, probe.NewError(fmt.Errorf("Error parsing sts endpoint: %w", err))
+		}
+		credsSts := &credentials.IAM{
+			Client: &http.Client{
+				Transport: config.getTransport(),
+			},
+			Endpoint: stsEndpointURL.String(),
+		}
+		credsChain = append(credsChain, credsSts)
+	}
+
+	signType := credentials.SignatureV4
+	if strings.EqualFold(config.Signature, "s3v2") {
+		signType = credentials.SignatureV2
+	}
+
+	// Credentials
+	creds := &credentials.Static{
+		Value: credentials.Value{
+			AccessKeyID:     config.AccessKey,
+			SecretAccessKey: config.SecretKey,
+			SessionToken:    config.SessionToken,
+			SignerType:      signType,
+		},
+	}
+	credsChain = append(credsChain, creds)
+	return credsChain, nil
+}
+
+// getTransport returns a corresponding *http.Transport for the *Config
+// set withS3v2 bool to true to add traceV2 tracer.
+func (config *Config) getTransport() http.RoundTripper {
+	if config.Transport == nil {
+		config.initTransport(true)
+	}
+	return config.Transport
+}
+
+func (config *Config) isTLS() bool {
+	if stsEndpoint := env.Get("MC_STS_ENDPOINT_"+config.Alias, ""); stsEndpoint != "" {
+		stsEndpointURL, err := url.Parse(stsEndpoint)
+		if err != nil {
+			return false
+		}
+		return isHostTLS(config) || stsEndpointURL.Scheme == "https"
+	}
+	return isHostTLS(config)
+}
+
+func (config *Config) initTransport(withS3v2 bool) {
+	var transport http.RoundTripper
+
+	useTLS := config.isTLS()
+
+	if config.Transport != nil {
+		transport = config.Transport
+	} else {
+		tr := &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           newCustomDialContext(config),
+			MaxIdleConnsPerHost:   1024,
+			WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
+			ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 10 * time.Second,
+			// Set this value so that the underlying transport round-tripper
+			// doesn't try to auto decode the body of objects with
+			// content-encoding set to `gzip`.
+			//
+			// Refer:
+			//    https://golang.org/src/net/http/transport.go?h=roundTrip#L1843
+			DisableCompression: true,
+		}
+		if useTLS {
+			tr.DialTLSContext = newCustomDialTLSContext(&tls.Config{
+				RootCAs:            globalRootCAs,
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: config.Insecure,
+			})
+
+			// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
+			// See https://github.com/golang/go/issues/14275
+			//
+			// TODO: Enable http2.0 when upstream issues related to HTTP/2 are fixed.
+			//
+			// if e = http2.ConfigureTransport(tr); e != nil {
+			// 	return nil, probe.NewError(e)
+			// }
+		}
+
+		if len(globalCustomHeader) > 0 {
+			transport = &headerTransport{
+				RoundTripper: tr,
+				customHeader: globalCustomHeader.Clone(),
+			}
+		} else {
+			transport = tr
+		}
+
+	}
+
+	transport = limiter.New(config.UploadLimit, config.DownloadLimit, transport)
+
+	if config.Debug {
+		if strings.EqualFold(config.Signature, "S3v4") {
+			transport = httptracer.GetNewTraceTransport(newTraceV4(), transport)
+		} else if strings.EqualFold(config.Signature, "S3v2") && withS3v2 {
+			transport = httptracer.GetNewTraceTransport(newTraceV2(), transport)
+		}
+	} else {
+		if !globalJSONLine && !globalJSON {
+			transport = notifyExpiringTLS{transport: transport}
+		}
+	}
+
+	transport = gzhttp.Transport(transport)
+	config.Transport = transport
 }
 
 // SelectObjectOpts - opts entered for select API
@@ -239,4 +407,16 @@ type SelectObjectOpts struct {
 	InputSerOpts    map[string]map[string]string
 	OutputSerOpts   map[string]map[string]string
 	CompressionType minio.SelectCompressionType
+}
+
+type headerTransport struct {
+	http.RoundTripper
+	customHeader http.Header
+}
+
+func (h *headerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	for k, v := range h.customHeader {
+		request.Header[k] = v
+	}
+	return h.RoundTripper.RoundTrip(request)
 }
