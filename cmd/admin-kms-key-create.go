@@ -24,13 +24,13 @@ import (
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 	"golang.org/x/term"
 )
 
 var adminKMSCreateKeyCmd = cli.Command{
 	Name:         "create",
-	Usage:        "creates a new master key at the KMS",
+	Usage:        "creates a new master KMS key",
 	Action:       mainAdminKMSCreateKey,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,

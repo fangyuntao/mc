@@ -27,7 +27,7 @@ import (
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // causeMessage container for golang error messages
@@ -177,4 +177,21 @@ func errorIf(err *probe.Error, msg string, data ...interface{}) {
 func deprecatedError(newCommandName string) {
 	err := probe.NewError(fmt.Errorf("Please use '%s' instead", newCommandName))
 	fatal(err, "Deprecated command")
+}
+
+// deprecatedError function for deprecated flags
+func deprecatedFlagError(oldFlag, newFlag string) {
+	err := probe.NewError(fmt.Errorf("'%s' has been deprecated, please use %s instead", oldFlag, newFlag))
+	fatal(err, "a deprecated Flag")
+}
+
+func deprecatedFlagsWarning(cliCtx *cli.Context) {
+	for _, v := range cliCtx.Args() {
+		switch v {
+		case "--encrypt", "-encrypt":
+			deprecatedFlagError("--encrypt", "--enc-s3 or --enc-kms")
+		case "--encrypt-key", "-encrypt-key":
+			deprecatedFlagError("--encrypt-key", "--enc-c")
+		}
+	}
 }

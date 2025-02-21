@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2022 MinIO, Inc.
+// Copyright (c) 2015-2024 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -25,12 +25,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime/multipart"
+	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,8 +37,8 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/licverifier"
-	"github.com/minio/pkg/v2/subnet"
+	"github.com/minio/pkg/v3/licverifier"
+	"github.com/minio/pkg/v3/subnet"
 	"github.com/tidwall/gjson"
 	"golang.org/x/term"
 )
@@ -57,44 +56,51 @@ var subnetCommonFlags = append(supportGlobalFlags, cli.StringFlag{
 	EnvVar: "_MC_SUBNET_API_KEY",
 })
 
-func subnetBaseURL() string {
-	return subnet.BaseURL(globalDevMode)
+// SubnetBaseURL - returns the base URL of SUBNET
+func SubnetBaseURL() string {
+	return subnet.BaseURL(GlobalDevMode)
+}
+
+func subnetIssueURL(issueNum int) string {
+	return fmt.Sprintf("%s/issues/%d", SubnetBaseURL(), issueNum)
 }
 
 func subnetLogWebhookURL() string {
-	return subnetBaseURL() + "/api/logs"
+	return SubnetBaseURL() + "/api/logs"
 }
 
-func subnetUploadURL(uploadType, filename string) string {
-	return fmt.Sprintf("%s/api/%s/upload?filename=%s", subnetBaseURL(), uploadType, filename)
+// SubnetUploadURL - returns the upload URL for the given upload type
+func SubnetUploadURL(uploadType string) string {
+	return fmt.Sprintf("%s/api/%s/upload", SubnetBaseURL(), uploadType)
 }
 
-func subnetRegisterURL() string {
-	return subnetBaseURL() + "/api/cluster/register"
+// SubnetRegisterURL - returns the cluster registration URL
+func SubnetRegisterURL() string {
+	return SubnetBaseURL() + "/api/cluster/register"
 }
 
 func subnetUnregisterURL(depID string) string {
-	return subnetBaseURL() + "/api/cluster/unregister?deploymentId=" + depID
+	return SubnetBaseURL() + "/api/cluster/unregister?deploymentId=" + depID
 }
 
 func subnetLicenseRenewURL() string {
-	return subnetBaseURL() + "/api/cluster/renew-license"
+	return SubnetBaseURL() + "/api/cluster/renew-license"
 }
 
 func subnetOfflineRegisterURL(regToken string) string {
-	return subnetBaseURL() + "/cluster/register?token=" + regToken
+	return SubnetBaseURL() + "/cluster/register?token=" + regToken
 }
 
 func subnetLoginURL() string {
-	return subnetBaseURL() + "/api/auth/login"
+	return SubnetBaseURL() + "/api/auth/login"
 }
 
 func subnetAPIKeyURL() string {
-	return subnetBaseURL() + "/api/auth/api-key"
+	return SubnetBaseURL() + "/api/auth/api-key"
 }
 
 func subnetMFAURL() string {
-	return subnetBaseURL() + "/api/auth/mfa-login"
+	return SubnetBaseURL() + "/api/auth/mfa-login"
 }
 
 func checkURLReachable(url string) *probe.Error {
@@ -118,12 +124,13 @@ func subnetURLWithAuth(reqURL, apiKey string) (string, map[string]string, error)
 			return "", nil, e
 		}
 	}
-	return reqURL, subnetAPIKeyAuthHeaders(apiKey), nil
+	return reqURL, SubnetAPIKeyAuthHeaders(apiKey), nil
 }
 
-type subnetHeaders map[string]string
+// SubnetHeaders - type for SUBNET request headers
+type SubnetHeaders map[string]string
 
-func (h subnetHeaders) addDeploymentIDHeader(alias string) {
+func (h SubnetHeaders) addDeploymentIDHeader(alias string) {
 	h[minioDeploymentIDHeader] = getAdminInfo(alias).DeploymentID
 }
 
@@ -131,18 +138,20 @@ func subnetTokenAuthHeaders(authToken string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + authToken}
 }
 
-func subnetLicenseAuthHeaders(lic string) map[string]string {
+// SubnetLicenseAuthHeaders - returns the headers for SUBNET license authentication
+func SubnetLicenseAuthHeaders(lic string) map[string]string {
 	return map[string]string{"x-subnet-license": lic}
 }
 
-func subnetAPIKeyAuthHeaders(apiKey string) subnetHeaders {
+// SubnetAPIKeyAuthHeaders - returns the headers for SUBNET API key authentication
+func SubnetAPIKeyAuthHeaders(apiKey string) SubnetHeaders {
 	return map[string]string{"x-subnet-api-key": apiKey}
 }
 
 func getSubnetClient() *http.Client {
 	client := httpClient(0)
-	if globalSubnetProxyURL != nil {
-		client.Transport.(*http.Transport).Proxy = http.ProxyURL(globalSubnetProxyURL)
+	if GlobalSubnetProxyURL != nil {
+		client.Transport.(*http.Transport).Proxy = http.ProxyURL(GlobalSubnetProxyURL)
 	}
 	return client
 }
@@ -250,7 +259,8 @@ func subnetGetReq(reqURL string, headers map[string]string) (string, error) {
 	return subnetReqDo(r, headers)
 }
 
-func subnetPostReq(reqURL string, payload interface{}, headers map[string]string) (string, error) {
+// SubnetPostReq - makes a POST request to SUBNET
+func SubnetPostReq(reqURL string, payload interface{}, headers map[string]string) (string, error) {
 	body, e := json.Marshal(payload)
 	if e != nil {
 		return "", e
@@ -312,7 +322,7 @@ func getSubnetAPIKeyFromConfig(alias string) string {
 }
 
 func setGlobalSubnetProxyFromConfig(alias string) error {
-	if globalSubnetProxyURL != nil {
+	if GlobalSubnetProxyURL != nil {
 		// proxy already set
 		return nil
 	}
@@ -335,7 +345,7 @@ func setGlobalSubnetProxyFromConfig(alias string) error {
 		if e != nil {
 			return e
 		}
-		globalSubnetProxyURL = proxyURL
+		GlobalSubnetProxyURL = proxyURL
 	}
 	return nil
 }
@@ -425,12 +435,20 @@ func setSubnetLicense(alias, lic string) {
 	setSubnetConfig(alias, "license", lic)
 }
 
-func getClusterRegInfo(admInfo madmin.InfoMessage, clusterName string) ClusterRegistrationInfo {
+// GetClusterRegInfo - returns the cluster registration info
+func GetClusterRegInfo(admInfo madmin.InfoMessage, clusterName string) ClusterRegistrationInfo {
 	noOfPools := 1
 	noOfDrives := 0
 	for _, srvr := range admInfo.Servers {
-		if srvr.PoolNumber > noOfPools {
-			noOfPools = srvr.PoolNumber
+		for _, poolNumber := range srvr.PoolNumbers {
+			if poolNumber > noOfPools {
+				noOfPools = poolNumber
+			}
+		}
+		if len(srvr.PoolNumbers) == 0 {
+			if srvr.PoolNumber != math.MaxInt && srvr.PoolNumber > noOfPools {
+				noOfPools = srvr.PoolNumber
+			}
 		}
 		noOfDrives += len(srvr.Disks)
 	}
@@ -493,7 +511,7 @@ func subnetLogin() (string, error) {
 		"username": username,
 		"password": string(bytepw),
 	}
-	respStr, e := subnetPostReq(subnetLoginURL(), loginReq, nil)
+	respStr, e := SubnetPostReq(subnetLoginURL(), loginReq, nil)
 	if e != nil {
 		return "", e
 	}
@@ -506,7 +524,7 @@ func subnetLogin() (string, error) {
 		fmt.Println()
 
 		mfaLoginReq := SubnetMFAReq{Username: username, OTP: string(byteotp), Token: mfaToken}
-		respStr, e = subnetPostReq(subnetMFAURL(), mfaLoginReq, nil)
+		respStr, e = SubnetPostReq(subnetMFAURL(), mfaLoginReq, nil)
 		if e != nil {
 			return "", e
 		}
@@ -567,7 +585,7 @@ func getSubnetAPIKey(alias string) (string, error) {
 }
 
 func getSubnetAPIKeyUsingLicense(lic string) (string, error) {
-	return getSubnetAPIKeyUsingAuthHeaders(subnetLicenseAuthHeaders(lic))
+	return getSubnetAPIKeyUsingAuthHeaders(SubnetLicenseAuthHeaders(lic))
 }
 
 func getSubnetAPIKeyUsingAuthToken(authToken string) (string, error) {
@@ -583,7 +601,7 @@ func getSubnetAPIKeyUsingAuthHeaders(authHeaders map[string]string) (string, err
 }
 
 func getSubnetLicenseUsingAPIKey(alias, apiKey string) (string, error) {
-	regInfo := getClusterRegInfo(getAdminInfo(alias), alias)
+	regInfo := GetClusterRegInfo(getAdminInfo(alias), alias)
 	_, lic, e := registerClusterOnSubnet(regInfo, alias, apiKey)
 	return lic, e
 }
@@ -591,7 +609,7 @@ func getSubnetLicenseUsingAPIKey(alias, apiKey string) (string, error) {
 // registerClusterOnSubnet - Registers the given cluster on SUBNET using given API key for auth
 // If the API key is empty, user will be asked to log in using SUBNET credentials.
 func registerClusterOnSubnet(clusterRegInfo ClusterRegistrationInfo, alias, apiKey string) (string, string, error) {
-	regURL, headers, e := subnetURLWithAuth(subnetRegisterURL(), apiKey)
+	regURL, headers, e := subnetURLWithAuth(SubnetRegisterURL(), apiKey)
 	if e != nil {
 		return "", "", e
 	}
@@ -602,7 +620,7 @@ func registerClusterOnSubnet(clusterRegInfo ClusterRegistrationInfo, alias, apiK
 	}
 
 	reqPayload := ClusterRegistrationReq{Token: regToken}
-	resp, e := subnetPostReq(regURL, reqPayload, headers)
+	resp, e := SubnetPostReq(regURL, reqPayload, headers)
 	if e != nil {
 		return "", "", e
 	}
@@ -622,7 +640,7 @@ func unregisterClusterFromSubnet(depID, apiKey string) error {
 		return e
 	}
 
-	_, e = subnetPostReq(regURL, nil, headers)
+	_, e = SubnetPostReq(regURL, nil, headers)
 	return e
 }
 
@@ -637,7 +655,7 @@ func validateAndSaveLic(lic, alias string, saveAPIKey bool) string {
 		fatalIf(errDummy().Trace(), fmt.Sprintf("License has expired on %s", li.ExpiresAt))
 	}
 
-	if len(li.DeploymentID) > 0 && li.DeploymentID != getAdminInfo(alias).DeploymentID {
+	if len(li.DeploymentID) > 0 && li.DeploymentID != uuid.Nil.String() && li.DeploymentID != getAdminInfo(alias).DeploymentID {
 		fatalIf(errDummy().Trace(), fmt.Sprintf("License is invalid for the deployment %s", alias))
 	}
 
@@ -690,7 +708,7 @@ func parseLicense(license string) (*licverifier.LicenseInfo, error) {
 		Client:            *client,
 		ExpiryGracePeriod: 0,
 	}
-	lv.Init(globalDevMode)
+	lv.Init(GlobalDevMode)
 	return lv.ParseLicense(license)
 }
 
@@ -708,65 +726,6 @@ func prepareSubnetUploadURL(uploadURL, alias, apiKey string) (string, map[string
 	return reqURL, headers
 }
 
-func uploadFileToSubnet(alias, filename, reqURL string, headers map[string]string) (string, error) {
-	req, e := subnetUploadReq(reqURL, filename)
-	if e != nil {
-		return "", e
-	}
-
-	resp, e := subnetReqDo(req, headers)
-	if e != nil {
-		return "", e
-	}
-
-	// Delete the file after successful upload
-	os.Remove(filename)
-
-	// ensure that both api-key and license from
-	// SUBNET response are saved in the config
-	extractAndSaveSubnetCreds(alias, resp)
-
-	return resp, e
-}
-
-func subnetUploadReq(url, filename string) (*http.Request, error) {
-	r, w := io.Pipe()
-	mwriter := multipart.NewWriter(w)
-	contentType := mwriter.FormDataContentType()
-
-	go func() {
-		var (
-			part io.Writer
-			e    error
-		)
-		defer func() {
-			mwriter.Close()
-			w.CloseWithError(e)
-		}()
-
-		part, e = mwriter.CreateFormFile("file", filepath.Base(filename))
-		if e != nil {
-			return
-		}
-
-		file, e := os.Open(filename)
-		if e != nil {
-			return
-		}
-		defer file.Close()
-
-		_, e = io.Copy(part, file)
-	}()
-
-	req, e := http.NewRequest(http.MethodPost, url, r)
-	if e != nil {
-		return nil, e
-	}
-	req.Header.Add("Content-Type", contentType)
-
-	return req, nil
-}
-
 func getAPIKeyFlag(ctx *cli.Context) (string, error) {
 	apiKey := ctx.String("api-key")
 
@@ -782,9 +741,10 @@ func getAPIKeyFlag(ctx *cli.Context) (string, error) {
 	return apiKey, nil
 }
 
-func initSubnetConnectivity(ctx *cli.Context, aliasedURL string, forUpload bool, failOnConnErr bool) (string, string) {
-	e := validateSubnetFlags(ctx, forUpload)
-	fatalIf(probe.NewError(e), "Invalid flags:")
+func initSubnetConnectivity(ctx *cli.Context, aliasedURL string, failOnConnErr bool) (string, string) {
+	if ctx.Bool("airgap") && len(ctx.String("api-key")) > 0 {
+		fatal(errDummy().Trace(), "--api-key is not applicable in airgap mode")
+	}
 
 	alias, _ := url2Alias(aliasedURL)
 
@@ -796,7 +756,7 @@ func initSubnetConnectivity(ctx *cli.Context, aliasedURL string, forUpload bool,
 		e = setGlobalSubnetProxyFromConfig(alias)
 		fatalIf(probe.NewError(e), "Error in setting SUBNET proxy:")
 
-		sbu := subnetBaseURL()
+		sbu := SubnetBaseURL()
 		err := checkURLReachable(sbu)
 		if err != nil && failOnConnErr {
 			fatal(err.Trace(aliasedURL), "Unable to reach %s, please use --airgap if there is no connectivity to SUBNET", sbu)
@@ -804,18 +764,4 @@ func initSubnetConnectivity(ctx *cli.Context, aliasedURL string, forUpload bool,
 	}
 
 	return alias, apiKey
-}
-
-func validateSubnetFlags(ctx *cli.Context, forUpload bool) error {
-	if !globalAirgapped {
-		if globalJSON && forUpload {
-			return errors.New("--json is applicable only when --airgap is also passed")
-		}
-		return nil
-	}
-
-	if len(ctx.String("api-key")) > 0 {
-		return errors.New("--api-key is not applicable in airgap mode")
-	}
-	return nil
 }

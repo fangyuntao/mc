@@ -27,7 +27,7 @@ import (
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // diff specific flags.
@@ -130,7 +130,7 @@ func checkDiffSyntax(ctx context.Context, cliCtx *cli.Context, encKeyDB map[stri
 	// Diff only works between two directories, verify them below.
 
 	// Verify if firstURL is accessible.
-	_, firstContent, err := url2Stat(ctx, firstURL, "", false, encKeyDB, time.Time{}, false)
+	_, firstContent, err := url2Stat(ctx, url2StatOptions{urlStr: firstURL, versionID: "", fileAttr: false, encKeyDB: encKeyDB, timeRef: time.Time{}, isZip: false, ignoreBucketExistsCheck: false})
 	if err != nil {
 		fatalIf(err.Trace(firstURL), fmt.Sprintf("Unable to stat '%s'.", firstURL))
 	}
@@ -141,7 +141,7 @@ func checkDiffSyntax(ctx context.Context, cliCtx *cli.Context, encKeyDB map[stri
 	}
 
 	// Verify if secondURL is accessible.
-	_, secondContent, err := url2Stat(ctx, secondURL, "", false, encKeyDB, time.Time{}, false)
+	_, secondContent, err := url2Stat(ctx, url2StatOptions{urlStr: secondURL, versionID: "", fileAttr: false, encKeyDB: encKeyDB, timeRef: time.Time{}, isZip: false, ignoreBucketExistsCheck: false})
 	if err != nil {
 		// Destination doesn't exist is okay.
 		if _, ok := err.ToGoError().(ObjectMissing); !ok {
@@ -184,7 +184,7 @@ func doDiffMain(ctx context.Context, firstURL, secondURL string) error {
 	}
 
 	// Diff first and second urls.
-	for diffMsg := range objectDifference(ctx, firstClient, secondClient, true) {
+	for diffMsg := range bucketObjectDifference(ctx, firstClient, secondClient) {
 		if diffMsg.Error != nil {
 			errorIf(diffMsg.Error, "Unable to calculate objects difference.")
 			// Ignore error and proceed to next object.
@@ -202,7 +202,7 @@ func mainDiff(cliCtx *cli.Context) error {
 	defer cancelDiff()
 
 	// Parse encryption keys per command.
-	encKeyDB, err := getEncKeys(cliCtx)
+	encKeyDB, err := validateAndCreateEncryptionKeys(cliCtx)
 	fatalIf(err, "Unable to parse encryption keys.")
 
 	// check 'diff' cli arguments.

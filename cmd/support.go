@@ -26,10 +26,13 @@ import (
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7/pkg/set"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
-const supportSuccessMsgTag = "SupportSuccessMessage"
+const (
+	supportSuccessMsgTag = "SupportSuccessMessage"
+	supportErrorMsgTag   = "SupportErrorMessage"
+)
 
 var supportGlobalFlags = append(globalFlags,
 	cli.BoolFlag{
@@ -52,6 +55,7 @@ var supportSubcommands = []cli.Command{
 	supportProfileCmd,
 	supportTopCmd,
 	supportProxyCmd,
+	supportUploadCmd,
 }
 
 var supportCmd = cli.Command{
@@ -94,6 +98,10 @@ func setSuccessMessageColor() {
 	console.SetColor(supportSuccessMsgTag, color.New(color.FgGreen, color.Bold))
 }
 
+func setErrorMessageColor() {
+	console.SetColor(supportErrorMsgTag, color.New(color.FgYellow, color.Italic))
+}
+
 func featureStatusStr(enabled bool) string {
 	if enabled {
 		return "enabled"
@@ -105,9 +113,9 @@ func validateClusterRegistered(alias string, cmdTalksToSubnet bool) string {
 	// Non-registered execution allowed only in following scenarios
 	// command doesn't talk to subnet: dev mode (`--dev` passed)
 	// command talks to subnet: dev+airgapped mode (both `--dev` and `--airgap` passed)
-	requireRegistration := !globalDevMode
+	requireRegistration := !GlobalDevMode
 	if cmdTalksToSubnet {
-		requireRegistration = !(globalDevMode && globalAirgapped)
+		requireRegistration = !(GlobalDevMode && globalAirgapped)
 	}
 
 	apiKey, e := getSubnetAPIKey(alias)

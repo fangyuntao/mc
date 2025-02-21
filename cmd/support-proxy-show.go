@@ -19,7 +19,7 @@ package cmd
 
 import (
 	"github.com/minio/cli"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var supportProxyShowCmd = cli.Command{
@@ -28,7 +28,7 @@ var supportProxyShowCmd = cli.Command{
 	Action:          mainSupportProxyShow,
 	OnUsageError:    onUsageError,
 	Before:          setGlobalsFromContext,
-	Flags:           supportGlobalFlags,
+	Flags:           globalFlags,
 	HideHelpCommand: true,
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}

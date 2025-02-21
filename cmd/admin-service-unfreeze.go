@@ -18,11 +18,13 @@
 package cmd
 
 import (
+	"context"
+
 	"github.com/fatih/color"
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var adminServiceUnfreezeCmd = cli.Command{
@@ -74,7 +76,7 @@ func checkAdminServiceUnfreezeSyntax(ctx *cli.Context) {
 }
 
 func mainAdminServiceUnfreeze(ctx *cli.Context) error {
-	// Validate serivce unfreeze syntax.
+	// Validate service unfreeze syntax.
 	checkAdminServiceUnfreezeSyntax(ctx)
 
 	// Set color.
@@ -88,8 +90,19 @@ func mainAdminServiceUnfreeze(ctx *cli.Context) error {
 	client, err := newAdminClient(aliasedURL)
 	fatalIf(err, "Unable to initialize admin connection.")
 
+	ctxt, cancel := context.WithCancel(globalContext)
+	defer cancel()
+
 	// Unfreeze the specified MinIO server
-	fatalIf(probe.NewError(client.ServiceUnfreeze(globalContext)), "Unable to unfreeze the server.")
+	e := client.ServiceUnfreezeV2(ctxt)
+	if e != nil {
+		// Attempt an older API server might be old
+		// nolint:staticcheck
+		// we need this fallback
+		e = client.ServiceUnfreeze(ctxt)
+	}
+	// Unfreeze the specified MinIO server
+	fatalIf(probe.NewError(e), "Unable to unfreeze the server.")
 
 	// Success..
 	printMsg(serviceUnfreezeCommand{Status: "success", ServerURL: aliasedURL})

@@ -29,7 +29,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,11 +36,10 @@ import (
 	"github.com/mattn/go-ieproxy"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/encrypt"
 
 	jwtgo "github.com/golang-jwt/jwt/v4"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 func isErrIgnored(err *probe.Error) (ignored bool) {
@@ -73,13 +71,6 @@ const (
 // UTCNow - returns current UTC time.
 func UTCNow() time.Time {
 	return time.Now().UTC()
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // randString generates random names and prepends them with a known prefix.
@@ -184,7 +175,16 @@ func isOlder(ti time.Time, olderRef string) bool {
 	}
 	objectAge := time.Since(ti)
 	olderThan, e := ParseDuration(olderRef)
-	fatalIf(probe.NewError(e), "Unable to parse olderThan=`"+olderRef+"`.")
+	if e != nil {
+		for _, format := range rewindSupportedFormat {
+			if t, e2 := time.Parse(format, olderRef); e2 == nil {
+				olderThan = Duration(time.Since(t))
+				e = nil
+				break
+			}
+		}
+	}
+	fatalIf(probe.NewError(e), "Unable to parse olderThan=`"+olderRef+"`. Supply relative '7d6h2m' or absolute '"+printDate+"'.")
 	return objectAge < time.Duration(olderThan)
 }
 
@@ -196,7 +196,16 @@ func isNewer(ti time.Time, newerRef string) bool {
 
 	objectAge := time.Since(ti)
 	newerThan, e := ParseDuration(newerRef)
-	fatalIf(probe.NewError(e), "Unable to parse newerThan=`"+newerRef+"`.")
+	if e != nil {
+		for _, format := range rewindSupportedFormat {
+			if t, e2 := time.Parse(format, newerRef); e2 == nil {
+				newerThan = Duration(time.Since(t))
+				e = nil
+				break
+			}
+		}
+	}
+	fatalIf(probe.NewError(e), "Unable to parse newerThan=`"+newerRef+"`. Supply relative '7d6h2m' or absolute '"+printDate+"'.")
 	return objectAge >= time.Duration(newerThan)
 }
 
@@ -211,108 +220,6 @@ func getLookupType(l string) minio.BucketLookupType {
 		return minio.BucketLookupPath
 	}
 	return minio.BucketLookupAuto
-}
-
-// struct representing object prefix and sse keys association.
-type prefixSSEPair struct {
-	Prefix string
-	SSE    encrypt.ServerSide
-}
-
-// parse and validate encryption keys entered on command line
-func parseAndValidateEncryptionKeys(sseKeys, sse string) (encMap map[string][]prefixSSEPair, err *probe.Error) {
-	encMap, err = parseEncryptionKeys(sseKeys)
-	if err != nil {
-		return nil, err
-	}
-	if sse != "" {
-		for _, prefix := range strings.Split(sse, ",") {
-			alias, _ := url2Alias(prefix)
-			encMap[alias] = append(encMap[alias], prefixSSEPair{
-				Prefix: prefix,
-				SSE:    encrypt.NewSSE(),
-			})
-		}
-	}
-	for alias, ps := range encMap {
-		if hostCfg := mustGetHostConfig(alias); hostCfg == nil {
-			for _, p := range ps {
-				return nil, probe.NewError(errors.New("SSE prefix " + p.Prefix + " has invalid alias"))
-			}
-		}
-	}
-	return encMap, nil
-}
-
-// parse list of comma separated alias/prefix=sse key values entered on command line and
-// construct a map of alias to prefix and sse pairs.
-func parseEncryptionKeys(sseKeys string) (encMap map[string][]prefixSSEPair, err *probe.Error) {
-	encMap = make(map[string][]prefixSSEPair)
-	if sseKeys == "" {
-		return
-	}
-	prefix := ""
-	index := 0 // start index of prefix
-	vs := 0    // start index of sse-c key
-	sseKeyLen := 32
-	delim := 1
-	k := len(sseKeys)
-	for index < k {
-		i := strings.Index(sseKeys[index:], "=")
-		if i == -1 {
-			return nil, probe.NewError(errors.New("SSE-C prefix should be of the form prefix1=key1,... "))
-		}
-		prefix = sseKeys[index : index+i]
-		alias, _ := url2Alias(prefix)
-		vs = i + 1 + index
-		if vs+32 > k {
-			return nil, probe.NewError(errors.New("SSE-C key should be 32 bytes long"))
-		}
-		if (vs+sseKeyLen < k) && sseKeys[vs+sseKeyLen] != ',' {
-			return nil, probe.NewError(errors.New("SSE-C prefix=secret should be delimited by , and secret should be 32 bytes long"))
-		}
-		sseKey := sseKeys[vs : vs+sseKeyLen]
-		if _, ok := encMap[alias]; !ok {
-			encMap[alias] = make([]prefixSSEPair, 0)
-		}
-		sse, e := encrypt.NewSSEC([]byte(sseKey))
-		if e != nil {
-			return nil, probe.NewError(e)
-		}
-		encMap[alias] = append(encMap[alias], prefixSSEPair{
-			Prefix: prefix,
-			SSE:    sse,
-		})
-		// advance index sseKeyLen + delim bytes for the next key start
-		index = vs + sseKeyLen + delim
-	}
-
-	// Sort encryption keys in descending order of prefix length
-	for _, encKeys := range encMap {
-		sort.Sort(byPrefixLength(encKeys))
-	}
-
-	// Success.
-	return encMap, nil
-}
-
-// byPrefixLength implements sort.Interface.
-type byPrefixLength []prefixSSEPair
-
-func (p byPrefixLength) Len() int { return len(p) }
-func (p byPrefixLength) Less(i, j int) bool {
-	return len(p[i].Prefix) > len(p[j].Prefix)
-}
-func (p byPrefixLength) Swap(i, j int) { p[i], p[j] = p[j], p[i] }
-
-// get SSE Key if object prefix matches with given resource.
-func getSSE(resource string, encKeys []prefixSSEPair) encrypt.ServerSide {
-	for _, k := range encKeys {
-		if strings.HasPrefix(resource, k.Prefix) {
-			return k.SSE
-		}
-	}
-	return nil
 }
 
 // Return true if target url is a part of a source url such as:
@@ -469,4 +376,22 @@ func getPrometheusToken(hostConfig *aliasConfigV10) (string, error) {
 		return "", e
 	}
 	return token, nil
+}
+
+// conservativeFileName returns a conservative file name
+func conservativeFileName(s string) string {
+	return strings.Trim(strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case strings.ContainsAny(string(r), "+-_%()[]!@"):
+			return r
+		default:
+			return '_'
+		}
+	}, s), "_")
 }

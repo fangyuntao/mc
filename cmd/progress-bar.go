@@ -25,7 +25,7 @@ import (
 
 	"github.com/cheggaaa/pb"
 	"github.com/fatih/color"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // progress extender.
@@ -59,18 +59,19 @@ func newPB(total int64) *pb.ProgressBar {
 
 	// Use different unicodes for Linux, OS X and Windows.
 	switch runtime.GOOS {
-	case "linux", "darwin":
+	case "linux":
 		// Need to add '\x00' as delimiter for unicode characters.
-		bar.Format("━\x00━\x00━\x00┉\x00━")
+		bar.Format("┃\x00▓\x00█\x00░\x00┃")
+	case "darwin":
+		// Need to add '\x00' as delimiter for unicode characters.
+		bar.Format(" \x00▓\x00 \x00░\x00 ")
 	default:
 		// Default to non unicode characters.
 		bar.Format("[=> ]")
 	}
 
 	// Start the progress bar.
-	bar.Start()
-
-	return bar
+	return bar.Start()
 }
 
 func newProgressReader(r io.Reader, caption string, total int64) *pb.Reader {
@@ -96,6 +97,10 @@ func (p *progressBar) SetCaption(caption string) *progressBar {
 	caption = fixateBarCaption(caption, getFixedWidth(p.ProgressBar.GetWidth(), 18))
 	p.ProgressBar.Prefix(caption)
 	return p
+}
+
+func (p *progressBar) Finish() {
+	p.ProgressBar.Finish()
 }
 
 func (p *progressBar) Set64(length int64) *progressBar {

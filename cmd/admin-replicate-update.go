@@ -26,7 +26,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var adminReplicateUpdateFlags = []cli.Flag{
@@ -51,7 +51,7 @@ var adminReplicateUpdateFlags = []cli.Flag{
 	},
 	cli.StringFlag{
 		Name:  "bucket-bandwidth",
-		Usage: "Set default bandwidth limit for bucket in bits per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
+		Usage: "Set default bandwidth limit for bucket in bytes per second (K,B,G,T for metric and Ki,Bi,Gi,Ti for IEC units)",
 	},
 	cli.BoolFlag{
 		Name:  "disable-ilm-expiry-replication",
@@ -86,7 +86,7 @@ EXAMPLES:
   1. Edit a site endpoint participating in cluster-level replication:
      {{.Prompt}} {{.HelpName}} myminio --deployment-id c1758167-4426-454f-9aae-5c3dfdf6df64 --endpoint https://minio2:9000
 
-  2. Edit a site in cluster-level replication to set default bandwidth limit for bucket:
+  2. Set default bucket bandwidth limit for replication from myminio to the peer cluster with deployment-id c1758167-4426-454f-9aae-5c3dfdf6df64
      {{.Prompt}} {{.HelpName}} myminio --deployment-id c1758167-4426-454f-9aae-5c3dfdf6df64 --bucket-bandwidth "2G"
 
   3. Disable replication of ILM expiry in cluster-level replication:

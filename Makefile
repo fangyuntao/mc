@@ -2,11 +2,14 @@ PWD := $(shell pwd)
 GOPATH := $(shell go env GOPATH)
 LDFLAGS := $(shell go run buildscripts/gen-ldflags.go)
 
-GOARCH := $(shell go env GOARCH)
-GOOS := $(shell go env GOOS)
+TARGET_GOARCH ?= $(shell go env GOARCH)
+TARGET_GOOS ?= $(shell go env GOOS)
 
 VERSION ?= $(shell git describe --tags)
 TAG ?= "minio/mc:$(VERSION)"
+
+GOLANGCI_DIR = .bin/golangci/$(GOLANGCI_VERSION)
+GOLANGCI = $(GOLANGCI_DIR)/golangci-lint
 
 all: build
 
@@ -16,9 +19,8 @@ checks:
 
 getdeps:
 	@mkdir -p ${GOPATH}/bin
-	@echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin
+	@echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOLANGCI_DIR)
 	@echo "Installing stringer" && go install -v golang.org/x/tools/cmd/stringer@latest
-	@echo "Installing staticheck" && go install honnef.co/go/tools/cmd/staticcheck@latest
 
 crosscompile:
 	@(env bash $(PWD)/buildscripts/cross-compile.sh)
@@ -32,10 +34,13 @@ vet:
 	@echo "Running $@"
 	@GO111MODULE=on go vet github.com/minio/mc/...
 
-lint:
+lint-fix: getdeps ## runs golangci-lint suite of linters with automatic fixes
 	@echo "Running $@ check"
-	@GO111MODULE=on ${GOPATH}/bin/golangci-lint run --timeout=5m --config ./.golangci.yml
-	@GO111MODULE=on ${GOPATH}/bin/staticcheck -tests=false -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-ST1023,-ST1005" ./...
+	@$(GOLANGCI) run --build-tags kqueue --timeout=10m --config ./.golangci.yml --fix
+
+lint: getdeps
+	@echo "Running $@ check"
+	@$(GOLANGCI) run --build-tags kqueue --timeout=10m --config ./.golangci.yml
 
 # Builds mc, runs the verifiers then runs the tests.
 check: test
@@ -43,7 +48,7 @@ test: verifiers build
 	@echo "Running unit tests"
 	@GO111MODULE=on CGO_ENABLED=0 go test -tags kqueue ./... 1>/dev/null
 	@echo "Running functional tests"
-	@(env bash $(PWD)/functional-tests.sh)
+	@GO111MODULE=on MC_TEST_RUN_FULL_SUITE=true go test -race -v --timeout 20m ./... -run Test_FullSuite
 
 test-race: verifiers build
 	@echo "Running unit tests under -race"
@@ -54,12 +59,12 @@ verify:
 	@echo "Verifying build with race"
 	@GO111MODULE=on CGO_ENABLED=1 go build -race -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/mc 1>/dev/null
 	@echo "Running functional tests"
-	@(env bash $(PWD)/functional-tests.sh)
+	@GO111MODULE=on MC_TEST_RUN_FULL_SUITE=true go test -race -v --timeout 20m ./... -run Test_FullSuite
 
 # Builds mc locally.
 build: checks
 	@echo "Building mc binary to './mc'"
-	@GO111MODULE=on CGO_ENABLED=0 go build -trimpath -tags kqueue --ldflags "$(LDFLAGS)" -o $(PWD)/mc
+	@GO111MODULE=on GOOS=$(TARGET_GOOS) GOARCH=$(TARGET_GOARCH) CGO_ENABLED=0 go build -trimpath -tags kqueue --ldflags "$(LDFLAGS)" -o $(PWD)/mc
 
 hotfix-vars:
 	$(eval LDFLAGS := $(shell MC_RELEASE="RELEASE" MC_HOTFIX="hotfix.$(shell git rev-parse --short HEAD)" go run buildscripts/gen-ldflags.go $(shell git describe --tags --abbrev=0 | \
@@ -73,9 +78,9 @@ hotfix: hotfix-vars install ## builds mc binary with hotfix tags
 	@sha256sum < ./mc.$(VERSION) | sed 's, -,mc.$(VERSION),g' > mc.$(VERSION).sha256sum
 
 hotfix-push: hotfix
-	@scp -q -r mc.$(VERSION)* minio@dl-0.min.io:~/releases/client/mc/hotfixes/linux-amd64/archive/
-	@scp -q -r mc.$(VERSION)* minio@dl-1.min.io:~/releases/client/mc/hotfixes/linux-amd64/archive/
-	@echo "Published new hotfix binaries at https://dl.min.io/client/mc/hotfixes/linux-amd64/archive/mc.$(VERSION)"
+	@scp -q -r mc.$(VERSION)* minio@dl-0.min.io:~/releases/client/mc/hotfixes/$(TARGET_GOOS)-$(TARGET_GOARCH)/archive/
+	@scp -q -r mc.$(VERSION)* minio@dl-1.min.io:~/releases/client/mc/hotfixes/$(TARGET_GOOS)-$(TARGET_GOARCH)/archive/
+	@echo "Published new hotfix binaries at https://dl.min.io/client/mc/hotfixes/$(TARGET_GOOS)-$(TARGET_GOARCH)/archive/mc.$(VERSION)"
 
 docker-hotfix-push: docker-hotfix
 	@docker push -q $(TAG) && echo "Published new container $(TAG)"

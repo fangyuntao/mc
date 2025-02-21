@@ -32,7 +32,7 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 	"github.com/olekukonko/tablewriter"
 )
 
@@ -86,9 +86,14 @@ func mainAdminReplicationResyncStatus(ctx *cli.Context) error {
 		console.Colorize("ResyncMessage", "SiteReplication is not enabled")
 		return nil
 	}
+
+	peerClient := getClient(args.Get(1))
+	peerAdmInfo, e := peerClient.ServerInfo(globalContext)
+	fatalIf(probe.NewError(e), "Unable to fetch server info of the peer.")
+
 	var peer madmin.PeerInfo
 	for _, site := range info.Sites {
-		if args[1] == site.Name {
+		if peerAdmInfo.DeploymentID == site.DeploymentID {
 			peer = site
 		}
 	}

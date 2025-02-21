@@ -28,7 +28,7 @@ import (
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var licenseInfoCmd = cli.Command{
@@ -179,7 +179,7 @@ func mainLicenseInfo(ctx *cli.Context) error {
 	initLicInfoColors()
 
 	aliasedURL := ctx.Args().Get(0)
-	alias, _ := initSubnetConnectivity(ctx, aliasedURL, false, true)
+	alias, _ := initSubnetConnectivity(ctx, aliasedURL, true)
 
 	apiKey, lic, e := getSubnetCreds(alias)
 	fatalIf(probe.NewError(e), "Error in checking cluster registration status")

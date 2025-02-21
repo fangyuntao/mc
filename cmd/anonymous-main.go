@@ -29,7 +29,7 @@ import (
 	"github.com/minio/cli"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 var anonymousFlags = []cli.Flag{
@@ -80,7 +80,7 @@ EXAMPLES:
      {{.Prompt}} {{.HelpName}} set public s3/public-commons/images
 
   5. Set a custom prefix based bucket anonymous on Amazon S3 cloud storage using a JSON file.
-     {{.Prompt}} {{.HelpName}} set-json s3/public-commons/images /path/to/anonymous.json
+     {{.Prompt}} {{.HelpName}} set-json /path/to/anonymous.json s3/public-commons/images 
 
   6. Get bucket permissions.
      {{.Prompt}} {{.HelpName}} get s3/shared
@@ -406,7 +406,7 @@ func runAnonymousLinksCmd(args cli.Args, recursive bool) {
 
 			// Encode public URL
 			u, e := url.Parse(content.URL.String())
-			errorIf(probe.NewError(e), "Unable to parse url `"+content.URL.String()+"`.")
+			errorIf(probe.NewError(e), "Unable to parse url `%s`.", content.URL)
 			publicURL := u.String()
 
 			// Construct the message to be displayed to the user
@@ -488,7 +488,7 @@ func mainAnonymous(ctx *cli.Context) error {
 	switch ctx.Args().First() {
 	case "set", "set-json", "get", "get-json":
 		// anonymous set [private|public|download|upload] alias/bucket/prefix
-		// anonymous set-json alias/bucket/prefix path-to-anonymous-json-file
+		// anonymous set-json path-to-anonymous-json-file alias/bucket/prefix
 		// anonymous get alias/bucket/prefix
 		// anonymous get-json alias/bucket/prefix
 		runAnonymousCmd(ctx.Args())

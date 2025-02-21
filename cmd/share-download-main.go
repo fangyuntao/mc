@@ -104,7 +104,7 @@ func checkShareDownloadSyntax(ctx context.Context, cliCtx *cli.Context, encKeyDB
 	// Validate if object exists only if the `--recursive` flag was NOT specified
 	if !isRecursive {
 		for _, url := range cliCtx.Args() {
-			_, _, err := url2Stat(ctx, url, "", false, encKeyDB, time.Time{}, false)
+			_, _, err := url2Stat(ctx, url2StatOptions{urlStr: url, versionID: "", fileAttr: false, encKeyDB: encKeyDB, timeRef: time.Time{}, isZip: false, ignoreBucketExistsCheck: false})
 			if err != nil {
 				fatalIf(err.Trace(url), "Unable to stat `"+url+"`.")
 			}
@@ -187,7 +187,7 @@ func doShareDownloadURL(ctx context.Context, targetURL, versionID string, isRecu
 		// Make new entries to shareDB.
 		contentType := "" // Not useful for download shares.
 		shareDB.Set(objectURL, shareURL, expiry, contentType)
-		printMsg(shareMesssage{
+		printMsg(shareMessage{
 			ObjectURL:   objectURL,
 			ShareURL:    shareURL,
 			TimeLeft:    expiry,
@@ -205,7 +205,7 @@ func mainShareDownload(cliCtx *cli.Context) error {
 	defer cancelShareDownload()
 
 	// Parse encryption keys per command.
-	encKeyDB, err := getEncKeys(cliCtx)
+	encKeyDB, err := validateAndCreateEncryptionKeys(cliCtx)
 	fatalIf(err, "Unable to parse encryption keys.")
 
 	// check input arguments.

@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
@@ -31,83 +30,30 @@ import (
 	"time"
 
 	"golang.org/x/net/http/httpguts"
-	"gopkg.in/h2non/filetype.v1"
 
 	"github.com/dustin/go-humanize"
-	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
-	"github.com/minio/pkg/v2/env"
+	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/pkg/v3/env"
 )
-
-// decode if the key is encoded key and returns the key
-func getDecodedKey(sseKeys string) (key string, err *probe.Error) {
-	keyString := ""
-	for i, sse := range strings.Split(sseKeys, ",") {
-		if i > 0 {
-			keyString = keyString + ","
-		}
-		sseString, err := parseKey(sse)
-		if err != nil {
-			return "", err
-		}
-		keyString = keyString + sseString
-	}
-	return keyString, nil
-}
-
-// Validate the key
-func parseKey(sseKeys string) (sse string, err *probe.Error) {
-	encryptString := strings.SplitN(sseKeys, "=", 2)
-	if len(encryptString) < 2 {
-		return "", probe.NewError(errors.New("SSE-C prefix should be of the form prefix1=key1,... "))
-	}
-
-	secretValue := encryptString[1]
-	if len(secretValue) == 32 {
-		return sseKeys, nil
-	}
-	decodedString, e := base64.StdEncoding.DecodeString(secretValue)
-	if e != nil || len(decodedString) != 32 {
-		return "", probe.NewError(errors.New("Encryption key should be 32 bytes plain text key or 44 bytes base64 encoded key"))
-	}
-	return encryptString[0] + "=" + string(decodedString), nil
-}
-
-// parse and return encryption key pairs per alias.
-func getEncKeys(ctx *cli.Context) (map[string][]prefixSSEPair, *probe.Error) {
-	sseServer := ctx.String("encrypt")
-	var sseKeys string
-	if keyPrefix := ctx.String("encrypt-key"); keyPrefix != "" {
-		if sseServer != "" && strings.Contains(keyPrefix, sseServer) {
-			return nil, errConflictSSE(sseServer, keyPrefix).Trace(ctx.Args()...)
-		}
-		sseKeys = keyPrefix
-	}
-	var err *probe.Error
-	if sseKeys != "" {
-		sseKeys, err = getDecodedKey(sseKeys)
-		if err != nil {
-			return nil, err.Trace(sseKeys)
-		}
-	}
-
-	encKeyDB, err := parseAndValidateEncryptionKeys(sseKeys, sseServer)
-	if err != nil {
-		return nil, err.Trace(sseKeys)
-	}
-
-	return encKeyDB, nil
-}
 
 // Check if the passed URL represents a folder. It may or may not exist yet.
 // If it exists, we can easily check if it is a folder, if it doesn't exist,
 // we can guess if the url is a folder from how it looks.
-func isAliasURLDir(ctx context.Context, aliasURL string, keys map[string][]prefixSSEPair, timeRef time.Time) (bool, *ClientContent) {
+func isAliasURLDir(ctx context.Context, aliasURL string, keys map[string][]prefixSSEPair, timeRef time.Time, ignoreBucketExists bool) (bool, *ClientContent) {
 	// If the target url exists, check if it is a directory
 	// and return immediately.
-	_, targetContent, err := url2Stat(ctx, aliasURL, "", false, keys, timeRef, false)
+	_, targetContent, err := url2Stat(ctx, url2StatOptions{
+		urlStr:                  aliasURL,
+		versionID:               "",
+		fileAttr:                false,
+		encKeyDB:                keys,
+		timeRef:                 timeRef,
+		isZip:                   false,
+		ignoreBucketExistsCheck: ignoreBucketExists,
+	})
 	if err == nil {
 		return targetContent.Type.IsDir(), targetContent
 	}
@@ -142,14 +88,14 @@ func isAliasURLDir(ctx context.Context, aliasURL string, keys map[string][]prefi
 
 // getSourceStreamMetadataFromURL gets a reader from URL.
 func getSourceStreamMetadataFromURL(ctx context.Context, aliasedURL, versionID string, timeRef time.Time, encKeyDB map[string][]prefixSSEPair, zip bool) (reader io.ReadCloser,
-	metadata map[string]string, err *probe.Error,
+	content *ClientContent, err *probe.Error,
 ) {
 	alias, urlStrFull, _, err := expandAlias(aliasedURL)
 	if err != nil {
 		return nil, nil, err.Trace(aliasedURL)
 	}
 	if !timeRef.IsZero() {
-		_, content, err := url2Stat(ctx, aliasedURL, "", false, nil, timeRef, false)
+		_, content, err := url2Stat(ctx, url2StatOptions{urlStr: aliasedURL, versionID: "", fileAttr: false, encKeyDB: nil, timeRef: timeRef, isZip: false, ignoreBucketExistsCheck: false})
 		if err != nil {
 			return nil, nil, err
 		}
@@ -166,8 +112,7 @@ func getSourceStreamMetadataFromURL(ctx context.Context, aliasedURL, versionID s
 
 type getSourceOpts struct {
 	GetOptions
-	fetchStat bool
-	preserve  bool
+	preserve bool
 }
 
 // getSourceStreamFromURL gets a reader from URL.
@@ -179,30 +124,6 @@ func getSourceStreamFromURL(ctx context.Context, urlStr string, encKeyDB map[str
 	opts.SSE = getSSE(urlStr, encKeyDB[alias])
 	reader, _, err = getSourceStream(ctx, alias, urlStrFull, opts)
 	return reader, err
-}
-
-func probeContentType(reader io.Reader) (ctype string, err *probe.Error) {
-	ctype = "application/octet-stream"
-	// Read a chunk to decide between utf-8 text and binary
-	if s, ok := reader.(io.Seeker); ok {
-		var buf [512]byte
-		n, _ := io.ReadFull(reader, buf[:])
-		if n <= 0 {
-			return ctype, nil
-		}
-		kind, e := filetype.Match(buf[:n])
-		if e != nil {
-			return ctype, probe.NewError(e)
-		}
-		// rewind to output whole file
-		if _, e = s.Seek(0, io.SeekStart); e != nil {
-			return ctype, probe.NewError(e)
-		}
-		if kind.MIME.Value != "" {
-			ctype = kind.MIME.Value
-		}
-	}
-	return ctype, nil
 }
 
 // Verify if reader is a generic ReaderAt
@@ -229,63 +150,18 @@ func isReadAt(reader io.Reader) (ok bool) {
 }
 
 // getSourceStream gets a reader from URL.
-func getSourceStream(ctx context.Context, alias, urlStr string, opts getSourceOpts) (reader io.ReadCloser, metadata map[string]string, err *probe.Error) {
+func getSourceStream(ctx context.Context, alias, urlStr string, opts getSourceOpts) (reader io.ReadCloser, content *ClientContent, err *probe.Error) {
 	sourceClnt, err := newClientFromAlias(alias, urlStr)
 	if err != nil {
 		return nil, nil, err.Trace(alias, urlStr)
 	}
-	reader, err = sourceClnt.Get(ctx, opts.GetOptions)
+
+	reader, content, err = sourceClnt.Get(ctx, opts.GetOptions)
 	if err != nil {
 		return nil, nil, err.Trace(alias, urlStr)
 	}
 
-	metadata = make(map[string]string)
-	if opts.fetchStat {
-		var st *ClientContent
-		mo, mok := reader.(*minio.Object)
-		if mok {
-			oinfo, e := mo.Stat()
-			if e != nil {
-				return nil, nil, probe.NewError(e).Trace(alias, urlStr)
-			}
-			st = &ClientContent{}
-			st.Time = oinfo.LastModified
-			st.Size = oinfo.Size
-			st.ETag = oinfo.ETag
-			st.Expires = oinfo.Expires
-			st.Type = os.FileMode(0o664)
-			st.Metadata = map[string]string{}
-			for k := range oinfo.Metadata {
-				st.Metadata[k] = oinfo.Metadata.Get(k)
-			}
-			st.ETag = oinfo.ETag
-		} else {
-			st, err = sourceClnt.Stat(ctx, StatOptions{preserve: opts.preserve, sse: opts.SSE})
-			if err != nil {
-				return nil, nil, err.Trace(alias, urlStr)
-			}
-		}
-
-		for k, v := range st.Metadata {
-			if httpguts.ValidHeaderFieldName(k) &&
-				httpguts.ValidHeaderFieldValue(v) {
-				metadata[k] = v
-			}
-		}
-
-		// All unrecognized files have `application/octet-stream`
-		// So we continue our detection process.
-		if ctype := metadata["Content-Type"]; ctype == "application/octet-stream" {
-			// Continue probing content-type if its filesystem stream.
-			if !mok {
-				metadata["Content-Type"], err = probeContentType(reader)
-				if err != nil {
-					return nil, nil, err.Trace(alias, urlStr)
-				}
-			}
-		}
-	}
-	return reader, metadata, nil
+	return reader, content, nil
 }
 
 // putTargetRetention sets retention headers if any
@@ -416,18 +292,18 @@ func getAllMetadata(ctx context.Context, sourceAlias, sourceURLStr string, srcSS
 // uploadSourceToTargetURL - uploads to targetURL from source.
 // optionally optimizes copy for object sizes <= 5GiB by using
 // server side copy operation.
-func uploadSourceToTargetURL(ctx context.Context, urls URLs, progress io.Reader, encKeyDB map[string][]prefixSSEPair, preserve, isZip bool) URLs {
-	sourceAlias := urls.SourceAlias
-	sourceURL := urls.SourceContent.URL
-	sourceVersion := urls.SourceContent.VersionID
-	targetAlias := urls.TargetAlias
-	targetURL := urls.TargetContent.URL
-	length := urls.SourceContent.Size
-	sourcePath := filepath.ToSlash(filepath.Join(sourceAlias, urls.SourceContent.URL.Path))
-	targetPath := filepath.ToSlash(filepath.Join(targetAlias, urls.TargetContent.URL.Path))
+func uploadSourceToTargetURL(ctx context.Context, uploadOpts uploadSourceToTargetURLOpts) URLs {
+	sourceAlias := uploadOpts.urls.SourceAlias
+	sourceURL := uploadOpts.urls.SourceContent.URL
+	sourceVersion := uploadOpts.urls.SourceContent.VersionID
+	targetAlias := uploadOpts.urls.TargetAlias
+	targetURL := uploadOpts.urls.TargetContent.URL
+	length := uploadOpts.urls.SourceContent.Size
+	sourcePath := filepath.ToSlash(filepath.Join(sourceAlias, uploadOpts.urls.SourceContent.URL.Path))
+	targetPath := filepath.ToSlash(filepath.Join(targetAlias, uploadOpts.urls.TargetContent.URL.Path))
 
-	srcSSE := getSSE(sourcePath, encKeyDB[sourceAlias])
-	tgtSSE := getSSE(targetPath, encKeyDB[targetAlias])
+	srcSSE := getSSE(sourcePath, uploadOpts.encKeyDB[sourceAlias])
+	tgtSSE := getSSE(targetPath, uploadOpts.encKeyDB[targetAlias])
 
 	var err *probe.Error
 	metadata := map[string]string{}
@@ -436,54 +312,54 @@ func uploadSourceToTargetURL(ctx context.Context, urls URLs, progress io.Reader,
 	// add object retention fields in metadata for target, if target wants
 	// to override defaults from source, usually happens in `cp` command.
 	// for the most part source metadata is copied over.
-	if urls.TargetContent.RetentionEnabled {
-		m := minio.RetentionMode(strings.ToUpper(urls.TargetContent.RetentionMode))
+	if uploadOpts.urls.TargetContent.RetentionEnabled {
+		m := minio.RetentionMode(strings.ToUpper(uploadOpts.urls.TargetContent.RetentionMode))
 		if !m.IsValid() {
-			return urls.WithError(probe.NewError(errors.New("invalid retention mode")).Trace(targetURL.String()))
+			return uploadOpts.urls.WithError(probe.NewError(errors.New("invalid retention mode")).Trace(targetURL.String()))
 		}
 
 		var dur uint64
 		var unit minio.ValidityUnit
-		dur, unit, err = parseRetentionValidity(urls.TargetContent.RetentionDuration)
+		dur, unit, err = parseRetentionValidity(uploadOpts.urls.TargetContent.RetentionDuration)
 		if err != nil {
-			return urls.WithError(err.Trace(targetURL.String()))
+			return uploadOpts.urls.WithError(err.Trace(targetURL.String()))
 		}
 
-		mode = urls.TargetContent.RetentionMode
+		mode = uploadOpts.urls.TargetContent.RetentionMode
 
 		until, err = getRetainUntilDate(dur, unit)
 		if err != nil {
-			return urls.WithError(err.Trace(sourceURL.String()))
+			return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 		}
 	}
 
 	// add object legal hold fields in metadata for target, if target wants
 	// to override defaults from source, usually happens in `cp` command.
 	// for the most part source metadata is copied over.
-	if urls.TargetContent.LegalHoldEnabled {
-		switch minio.LegalHoldStatus(urls.TargetContent.LegalHold) {
+	if uploadOpts.urls.TargetContent.LegalHoldEnabled {
+		switch minio.LegalHoldStatus(uploadOpts.urls.TargetContent.LegalHold) {
 		case minio.LegalHoldDisabled:
 		case minio.LegalHoldEnabled:
 		default:
-			return urls.WithError(errInvalidArgument().Trace(urls.TargetContent.LegalHold))
+			return uploadOpts.urls.WithError(errInvalidArgument().Trace(uploadOpts.urls.TargetContent.LegalHold))
 		}
-		legalHold = urls.TargetContent.LegalHold
+		legalHold = uploadOpts.urls.TargetContent.LegalHold
 	}
 
-	for k, v := range urls.SourceContent.UserMetadata {
+	for k, v := range uploadOpts.urls.SourceContent.UserMetadata {
 		metadata[http.CanonicalHeaderKey(k)] = v
 	}
-	for k, v := range urls.SourceContent.Metadata {
+	for k, v := range uploadOpts.urls.SourceContent.Metadata {
 		metadata[http.CanonicalHeaderKey(k)] = v
 	}
 
 	// Optimize for server side copy if the host is same.
-	if sourceAlias == targetAlias && !isZip {
+	if sourceAlias == targetAlias && !uploadOpts.isZip && !uploadOpts.urls.checksum.IsSet() {
 		// preserve new metadata and save existing ones.
-		if preserve {
-			currentMetadata, err := getAllMetadata(ctx, sourceAlias, sourceURL.String(), srcSSE, urls)
+		if uploadOpts.preserve {
+			currentMetadata, err := getAllMetadata(ctx, sourceAlias, sourceURL.String(), srcSSE, uploadOpts.urls)
 			if err != nil {
-				return urls.WithError(err.Trace(sourceURL.String()))
+				return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 			}
 			for k, v := range currentMetadata {
 				metadata[k] = v
@@ -491,39 +367,39 @@ func uploadSourceToTargetURL(ctx context.Context, urls URLs, progress io.Reader,
 		}
 
 		// Get metadata from target content as well
-		for k, v := range urls.TargetContent.Metadata {
+		for k, v := range uploadOpts.urls.TargetContent.Metadata {
 			metadata[http.CanonicalHeaderKey(k)] = v
 		}
 
 		// Get userMetadata from target content as well
-		for k, v := range urls.TargetContent.UserMetadata {
+		for k, v := range uploadOpts.urls.TargetContent.UserMetadata {
 			metadata[http.CanonicalHeaderKey(k)] = v
 		}
 
 		sourcePath := filepath.ToSlash(sourceURL.Path)
-		if urls.SourceContent.RetentionEnabled {
+		if uploadOpts.urls.SourceContent.RetentionEnabled {
 			err = putTargetRetention(ctx, targetAlias, targetURL.String(), metadata)
-			return urls.WithError(err.Trace(sourceURL.String()))
+			return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 		}
 
 		opts := CopyOptions{
 			srcSSE:           srcSSE,
 			tgtSSE:           tgtSSE,
 			metadata:         filterMetadata(metadata),
-			disableMultipart: urls.DisableMultipart,
-			isPreserve:       preserve,
-			storageClass:     urls.TargetContent.StorageClass,
+			disableMultipart: uploadOpts.urls.DisableMultipart,
+			isPreserve:       uploadOpts.preserve,
+			storageClass:     uploadOpts.urls.TargetContent.StorageClass,
 		}
 
 		err = copySourceToTargetURL(ctx, targetAlias, targetURL.String(), sourcePath, sourceVersion, mode, until,
-			legalHold, length, progress, opts)
+			legalHold, length, uploadOpts.progress, opts)
 	} else {
-		if urls.SourceContent.RetentionEnabled {
+		if uploadOpts.urls.SourceContent.RetentionEnabled {
 			// preserve new metadata and save existing ones.
-			if preserve {
-				currentMetadata, err := getAllMetadata(ctx, sourceAlias, sourceURL.String(), srcSSE, urls)
+			if uploadOpts.preserve {
+				currentMetadata, err := getAllMetadata(ctx, sourceAlias, sourceURL.String(), srcSSE, uploadOpts.urls)
 				if err != nil {
-					return urls.WithError(err.Trace(sourceURL.String()))
+					return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 				}
 				for k, v := range currentMetadata {
 					metadata[k] = v
@@ -531,83 +407,120 @@ func uploadSourceToTargetURL(ctx context.Context, urls URLs, progress io.Reader,
 			}
 
 			// Get metadata from target content as well
-			for k, v := range urls.TargetContent.Metadata {
+			for k, v := range uploadOpts.urls.TargetContent.Metadata {
 				metadata[http.CanonicalHeaderKey(k)] = v
 			}
 
 			// Get userMetadata from target content as well
-			for k, v := range urls.TargetContent.UserMetadata {
+			for k, v := range uploadOpts.urls.TargetContent.UserMetadata {
 				metadata[http.CanonicalHeaderKey(k)] = v
 			}
 
 			err = putTargetRetention(ctx, targetAlias, targetURL.String(), metadata)
-			return urls.WithError(err.Trace(sourceURL.String()))
+			return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 		}
 
-		var reader io.ReadCloser
 		// Proceed with regular stream copy.
-		reader, metadata, err = getSourceStream(ctx, sourceAlias, sourceURL.String(), getSourceOpts{
+		var (
+			content *ClientContent
+			reader  io.ReadCloser
+		)
+
+		reader, content, err = getSourceStream(ctx, sourceAlias, sourceURL.String(), getSourceOpts{
 			GetOptions: GetOptions{
 				VersionID: sourceVersion,
 				SSE:       srcSSE,
-				Zip:       isZip,
+				Zip:       uploadOpts.isZip,
+				Preserve:  uploadOpts.preserve,
 			},
-			fetchStat: true,
-			preserve:  preserve,
 		})
 		if err != nil {
-			return urls.WithError(err.Trace(sourceURL.String()))
+			return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 		}
 		defer reader.Close()
 
+		if uploadOpts.updateProgressTotal {
+			pg, ok := uploadOpts.progress.(*progressBar)
+			if ok {
+				pg.SetTotal(content.Size)
+			}
+		}
+
+		metadata := make(map[string]string, len(content.Metadata))
+		for k, v := range content.Metadata {
+			metadata[k] = v
+		}
+
 		// Get metadata from target content as well
-		for k, v := range urls.TargetContent.Metadata {
+		for k, v := range uploadOpts.urls.TargetContent.Metadata {
 			metadata[http.CanonicalHeaderKey(k)] = v
 		}
 
 		// Get userMetadata from target content as well
-		for k, v := range urls.TargetContent.UserMetadata {
+		for k, v := range uploadOpts.urls.TargetContent.UserMetadata {
 			metadata[http.CanonicalHeaderKey(k)] = v
+		}
+
+		if content.Tags != nil {
+			tags, err := tags.NewTags(content.Tags, true)
+			if err != nil {
+				return uploadOpts.urls.WithError(probe.NewError(err))
+			}
+			metadata["X-Amz-Tagging"] = tags.String()
+			delete(metadata, "X-Amz-Tagging-Count")
 		}
 
 		var e error
 		var multipartSize uint64
-		if v := env.Get("MC_UPLOAD_MULTIPART_SIZE", ""); v != "" {
+		var multipartThreads int
+		var v string
+		if uploadOpts.multipartSize == "" {
+			v = env.Get("MC_UPLOAD_MULTIPART_SIZE", "")
+		} else {
+			v = uploadOpts.multipartSize
+		}
+		if v != "" {
 			multipartSize, e = humanize.ParseBytes(v)
 			if e != nil {
-				return urls.WithError(probe.NewError(e))
+				return uploadOpts.urls.WithError(probe.NewError(e))
 			}
 		}
 
-		multipartThreads, e := strconv.Atoi(env.Get("MC_UPLOAD_MULTIPART_THREADS", "4"))
+		if uploadOpts.multipartThreads == "" {
+			multipartThreads, e = strconv.Atoi(env.Get("MC_UPLOAD_MULTIPART_THREADS", "4"))
+		} else {
+			multipartThreads, e = strconv.Atoi(uploadOpts.multipartThreads)
+		}
 		if e != nil {
-			return urls.WithError(probe.NewError(e))
+			return uploadOpts.urls.WithError(probe.NewError(e))
 		}
 
 		putOpts := PutOptions{
 			metadata:         filterMetadata(metadata),
 			sse:              tgtSSE,
-			storageClass:     urls.TargetContent.StorageClass,
-			md5:              urls.MD5,
-			disableMultipart: urls.DisableMultipart,
-			isPreserve:       preserve,
+			storageClass:     uploadOpts.urls.TargetContent.StorageClass,
+			md5:              uploadOpts.urls.MD5,
+			disableMultipart: uploadOpts.urls.DisableMultipart,
+			isPreserve:       uploadOpts.preserve,
 			multipartSize:    multipartSize,
 			multipartThreads: uint(multipartThreads),
+			ifNotExists:      uploadOpts.ifNotExists,
+			checksum:         uploadOpts.urls.checksum,
 		}
 
-		if isReadAt(reader) {
+		if isReadAt(reader) || length == 0 {
 			_, err = putTargetStream(ctx, targetAlias, targetURL.String(), mode, until,
-				legalHold, reader, length, progress, putOpts)
+				legalHold, reader, length, uploadOpts.progress, putOpts)
 		} else {
 			_, err = putTargetStream(ctx, targetAlias, targetURL.String(), mode, until,
-				legalHold, io.LimitReader(reader, length), length, progress, putOpts)
+				legalHold, io.LimitReader(reader, length), length, uploadOpts.progress, putOpts)
 		}
 	}
 	if err != nil {
-		return urls.WithError(err.Trace(sourceURL.String()))
+		return uploadOpts.urls.WithError(err.Trace(sourceURL.String()))
 	}
 
-	return urls.WithError(nil)
+	return uploadOpts.urls.WithError(nil)
 }
 
 // newClientFromAlias gives a new client interface for matching
@@ -665,4 +578,15 @@ func ParseForm(r *http.Request) error {
 		}
 	}
 	return nil
+}
+
+type uploadSourceToTargetURLOpts struct {
+	urls                URLs
+	progress            io.Reader
+	encKeyDB            map[string][]prefixSSEPair
+	preserve, isZip     bool
+	multipartSize       string
+	multipartThreads    string
+	updateProgressTotal bool
+	ifNotExists         bool
 }

@@ -34,7 +34,7 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/v2/mimedb"
+	"github.com/minio/pkg/v3/mimedb"
 )
 
 var sqlFlags = []cli.Flag{
@@ -80,7 +80,7 @@ var sqlCmd = cli.Command{
 	Action:       mainSQL,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,
-	Flags:        append(append(sqlFlags, ioFlags...), globalFlags...),
+	Flags:        append(append(sqlFlags, encCFlag), globalFlags...),
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
 
@@ -90,8 +90,6 @@ USAGE:
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}{{end}}
-ENVIRONMENT VARIABLES:
-  MC_ENCRYPT_KEY: list of comma delimited prefix=secret values
 
 SERIALIZATION OPTIONS:
   For query serialization options, refer to https://min.io/docs/minio/linux/reference/minio-mc/mc-sql.html#command-mc.sql
@@ -104,7 +102,7 @@ EXAMPLES:
      {{.Prompt}} {{.HelpName}} --query "select count(s.power) from S3Object s" myminio/iot-devices/power-ratio.csv
 
   3. Run a query on an encrypted object with customer provided keys.
-     {{.Prompt}} {{.HelpName}} --encrypt-key "myminio/iot-devices=32byteslongsecretkeymustbegiven1" \
+     {{.Prompt}} {{.HelpName}} --enc-c "myminio/iot-devices=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA" \
          --query "select count(s.power) from S3Object s" myminio/iot-devices/power-ratio-encrypted.csv
 
   4. Run a query on an object on MinIO in gzip format using ; as field delimiter,
@@ -308,11 +306,12 @@ func getCSVHeader(sourceURL string, encKeyDB map[string][]prefixSSEPair) ([]stri
 		r = os.Stdin
 	default:
 		var err *probe.Error
-		var metadata map[string]string
-		if r, metadata, err = getSourceStreamMetadataFromURL(globalContext, sourceURL, "", time.Time{}, encKeyDB, false); err != nil {
+		var content *ClientContent
+		if r, content, err = getSourceStreamMetadataFromURL(globalContext, sourceURL, "", time.Time{}, encKeyDB, false); err != nil {
 			return nil, err.Trace(sourceURL)
 		}
-		ctype := metadata["Content-Type"]
+
+		ctype := content.Metadata["Content-Type"]
 		if strings.Contains(ctype, "gzip") {
 			var e error
 			r, e = gzip.NewReader(r)
@@ -444,7 +443,7 @@ func mainSQL(cliCtx *cli.Context) error {
 		query   string
 	)
 	// Parse encryption keys per command.
-	encKeyDB, err := getEncKeys(cliCtx)
+	encKeyDB, err := validateAndCreateEncryptionKeys(cliCtx)
 	fatalIf(err, "Unable to parse encryption keys.")
 
 	// validate sql input arguments.
@@ -453,8 +452,8 @@ func mainSQL(cliCtx *cli.Context) error {
 	URLs := cliCtx.Args()
 	writeHdr := true
 	for _, url := range URLs {
-		if _, targetContent, err := url2Stat(ctx, url, "", false, encKeyDB, time.Time{}, false); err != nil {
-			errorIf(err.Trace(url), "Unable to run sql for "+url+".")
+		if _, targetContent, err := url2Stat(ctx, url2StatOptions{urlStr: url, versionID: "", fileAttr: false, encKeyDB: encKeyDB, timeRef: time.Time{}, isZip: false, ignoreBucketExistsCheck: false}); err != nil {
+			errorIf(err.Trace(url), "Unable to run sql for %s.", url)
 			continue
 		} else if !targetContent.Type.IsDir() {
 			if writeHdr {
@@ -467,13 +466,13 @@ func mainSQL(cliCtx *cli.Context) error {
 		targetAlias, targetURL, _ := mustExpandAlias(url)
 		clnt, err := newClientFromAlias(targetAlias, targetURL)
 		if err != nil {
-			errorIf(err.Trace(url), "Unable to initialize target `"+url+"`.")
+			errorIf(err.Trace(url), "Unable to initialize target `%s`.", url)
 			continue
 		}
 
 		for content := range clnt.List(ctx, ListOptions{Recursive: cliCtx.Bool("recursive"), WithMetadata: true, ShowDir: DirNone}) {
 			if content.Err != nil {
-				errorIf(content.Err.Trace(url), "Unable to list on target `"+url+"`.")
+				errorIf(content.Err.Trace(url), "Unable to list on target `%s`.", url)
 				continue
 			}
 			if writeHdr {

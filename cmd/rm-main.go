@@ -33,7 +33,7 @@ import (
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/minio-go/v7"
-	"github.com/minio/pkg/v2/console"
+	"github.com/minio/pkg/v3/console"
 )
 
 // rm specific flags.
@@ -111,7 +111,7 @@ var rmCmd = cli.Command{
 	Action:       mainRm,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,
-	Flags:        append(append(rmFlags, ioFlags...), globalFlags...),
+	Flags:        append(rmFlags, globalFlags...),
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
 
@@ -121,8 +121,6 @@ USAGE:
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
-ENVIRONMENT VARIABLES:
-  MC_ENCRYPT_KEY: list of comma delimited prefix=secret values
 
 EXAMPLES:
   01. Remove a file.
@@ -152,16 +150,13 @@ EXAMPLES:
   09. Drop all incomplete uploads on the bucket 'jazz-songs'.
       {{.Prompt}} {{.HelpName}} --incomplete --recursive --force s3/jazz-songs/
 
-  10. Remove an encrypted object from Amazon S3 cloud storage.
-      {{.Prompt}} {{.HelpName}} --encrypt-key "s3/sql-backups/=32byteslongsecretkeymustbegiven1" s3/sql-backups/1999/old-backup.tgz
-
-  11. Bypass object retention in governance mode and delete the object.
+  10. Bypass object retention in governance mode and delete the object.
       {{.Prompt}} {{.HelpName}} --bypass s3/pop-songs/
 
-  12. Remove a particular version ID.
+  11. Remove a particular version ID.
       {{.Prompt}} {{.HelpName}} s3/docs/money.xls --version-id "f20f3792-4bd4-4288-8d3c-b9d05b3b62f6"
 
-  13. Remove all object versions older than one year.
+  12. Remove all object versions older than one year.
       {{.Prompt}} {{.HelpName}} s3/docs/ --recursive --versions --rewind 365d
 
   14. Perform a fake removal of object(s) versions that are non-current and older than 10 days. If top-level version is a delete 
@@ -211,7 +206,7 @@ func (r rmMessage) JSON() string {
 }
 
 // Validate command line arguments.
-func checkRmSyntax(ctx context.Context, cliCtx *cli.Context, encKeyDB map[string][]prefixSSEPair) {
+func checkRmSyntax(ctx context.Context, cliCtx *cli.Context) {
 	// Set command flags from context.
 	isForce := cliCtx.Bool("force")
 	isRecursive := cliCtx.Bool("recursive")
@@ -248,26 +243,30 @@ func checkRmSyntax(ctx context.Context, cliCtx *cli.Context, encKeyDB map[string
 		fatalIf(errDummy().Trace(),
 			"You cannot specify --purge flag with any flag(s) other than --force.")
 	}
-	for _, url := range cliCtx.Args() {
-		// clean path for aliases like s3/.
-		// Note: UNC path using / works properly in go 1.9.2 even though it breaks the UNC specification.
-		url = filepath.ToSlash(filepath.Clean(url))
-		// namespace removal applies only for non FS. So filter out if passed url represents a directory
-		dir, _ := isAliasURLDir(ctx, url, encKeyDB, time.Time{})
-		if dir {
-			_, path := url2Alias(url)
-			isNamespaceRemoval = (path == "")
-			break
-		}
-		if dir && isRecursive && !isForce {
-			fatalIf(errDummy().Trace(),
-				"Removal requires --force flag. This operation is *IRREVERSIBLE*. Please review carefully before performing this *DANGEROUS* operation.")
-		}
-		if dir && !isRecursive {
-			fatalIf(errDummy().Trace(),
-				"Removal requires --recursive flag. This operation is *IRREVERSIBLE*. Please review carefully before performing this *DANGEROUS* operation.")
+
+	if !isForceDel {
+		for _, url := range cliCtx.Args() {
+			// clean path for aliases like s3/.
+			// Note: UNC path using / works properly in go 1.9.2 even though it breaks the UNC specification.
+			url = filepath.ToSlash(filepath.Clean(url))
+			// namespace removal applies only for non FS. So filter out if passed url represents a directory
+			dir, _ := isAliasURLDir(ctx, url, nil, time.Time{}, false)
+			if dir {
+				_, path := url2Alias(url)
+				isNamespaceRemoval = (path == "")
+				break
+			}
+			if dir && isRecursive && !isForce {
+				fatalIf(errDummy().Trace(),
+					"Removal requires --force flag. This operation is *IRREVERSIBLE*. Please review carefully before performing this *DANGEROUS* operation.")
+			}
+			if dir && !isRecursive {
+				fatalIf(errDummy().Trace(),
+					"Removal requires --recursive flag. This operation is *IRREVERSIBLE*. Please review carefully before performing this *DANGEROUS* operation.")
+			}
 		}
 	}
+
 	if !cliCtx.Args().Present() && !isStdin {
 		exitCode := 1
 		showCommandHelpAndExit(cliCtx, exitCode)
@@ -302,80 +301,90 @@ func removeSingle(url, versionID string, opts removeOpts) error {
 		modTime time.Time
 	)
 
-	_, content, pErr := url2Stat(ctx, url, versionID, false, opts.encKeyDB, time.Time{}, false)
-	if pErr != nil {
-		switch st := minio.ToErrorResponse(pErr.ToGoError()).StatusCode; st {
-		case http.StatusBadRequest, http.StatusMethodNotAllowed:
-			ignoreStatError = true
-		default:
-			_, ok := pErr.ToGoError().(ObjectMissing)
-			ignoreStatError = (st == http.StatusServiceUnavailable || ok || st == http.StatusNotFound) && (opts.isForce && opts.isForceDel)
-			if !ignoreStatError {
-				errorIf(pErr.Trace(url), "Failed to remove `"+url+"`.")
-				return exitStatus(globalErrorExitStatus)
-			}
-		}
-	} else {
-		isDir = content.Type.IsDir()
-		modTime = content.Time
-	}
-
-	// We should not proceed
-	if ignoreStatError && opts.olderThan != "" || opts.newerThan != "" {
-		errorIf(pErr.Trace(url), "Unable to stat `"+url+"`.")
-		return exitStatus(globalErrorExitStatus)
-	}
-
-	// Skip objects older than older--than parameter if specified
-	if opts.olderThan != "" && isOlder(modTime, opts.olderThan) {
-		return nil
-	}
-
-	// Skip objects older than older--than parameter if specified
-	if opts.newerThan != "" && isNewer(modTime, opts.newerThan) {
-		return nil
-	}
-
 	targetAlias, targetURL, _ := mustExpandAlias(url)
-	if !opts.isFake {
-		clnt, pErr := newClientFromAlias(targetAlias, targetURL)
+	if !opts.isForceDel {
+		_, content, pErr := url2Stat(ctx, url2StatOptions{
+			urlStr:                  url,
+			versionID:               versionID,
+			fileAttr:                false,
+			timeRef:                 time.Time{},
+			isZip:                   false,
+			ignoreBucketExistsCheck: false,
+		})
 		if pErr != nil {
-			errorIf(pErr.Trace(url), "Invalid argument `"+url+"`.")
-			return exitStatus(globalErrorExitStatus) // End of journey.
-		}
-
-		if !strings.HasSuffix(targetURL, string(clnt.GetURL().Separator)) && isDir {
-			targetURL = targetURL + string(clnt.GetURL().Separator)
-		}
-
-		contentCh := make(chan *ClientContent, 1)
-		contentURL := *newClientURL(targetURL)
-		contentCh <- &ClientContent{URL: contentURL, VersionID: versionID}
-		close(contentCh)
-		isRemoveBucket := false
-		resultCh := clnt.Remove(ctx, opts.isIncomplete, isRemoveBucket, opts.isBypass, opts.isForce && opts.isForceDel, contentCh)
-		for result := range resultCh {
-			if result.Err != nil {
-				errorIf(result.Err.Trace(url), "Failed to remove `"+url+"`.")
-				switch result.Err.ToGoError().(type) {
-				case PathInsufficientPermission:
-					// Ignore Permission error.
-					continue
+			switch st := minio.ToErrorResponse(pErr.ToGoError()).StatusCode; st {
+			case http.StatusBadRequest, http.StatusMethodNotAllowed:
+				ignoreStatError = true
+			default:
+				_, ok := pErr.ToGoError().(ObjectMissing)
+				ignoreStatError = (st == http.StatusServiceUnavailable || ok || st == http.StatusNotFound) && (opts.isForce && opts.isForceDel)
+				if !ignoreStatError {
+					errorIf(pErr.Trace(url), "Failed to remove `%s`.", url)
+					return exitStatus(globalErrorExitStatus)
 				}
-				return exitStatus(globalErrorExitStatus)
 			}
-			msg := rmMessage{
-				Key:       path.Join(targetAlias, result.BucketName, result.ObjectName),
-				VersionID: result.ObjectVersionID,
-			}
-			if result.DeleteMarker {
-				msg.DeleteMarker = true
-				msg.VersionID = result.DeleteMarkerVersionID
-			}
-			printMsg(msg)
+		} else {
+			isDir = content.Type.IsDir()
+			modTime = content.Time
 		}
-	} else {
-		printDryRunMsg(targetAlias, content, opts.withVersions)
+
+		// We should not proceed
+		if ignoreStatError && (opts.olderThan != "" || opts.newerThan != "") {
+			errorIf(pErr.Trace(url), "Unable to stat `%s`.", url)
+			return exitStatus(globalErrorExitStatus)
+		}
+
+		// Skip objects older than older--than parameter if specified
+		if opts.olderThan != "" && isOlder(modTime, opts.olderThan) {
+			return nil
+		}
+
+		// Skip objects older than older--than parameter if specified
+		if opts.newerThan != "" && isNewer(modTime, opts.newerThan) {
+			return nil
+		}
+
+		if opts.isFake {
+			printDryRunMsg(targetAlias, content, opts.withVersions)
+			return nil
+		}
+	}
+
+	clnt, pErr := newClientFromAlias(targetAlias, targetURL)
+	if pErr != nil {
+		errorIf(pErr.Trace(url), "Invalid argument `%s`.", url)
+		return exitStatus(globalErrorExitStatus) // End of journey.
+	}
+
+	if !strings.HasSuffix(targetURL, string(clnt.GetURL().Separator)) && isDir {
+		targetURL = targetURL + string(clnt.GetURL().Separator)
+	}
+
+	contentCh := make(chan *ClientContent, 1)
+	contentURL := *newClientURL(targetURL)
+	contentCh <- &ClientContent{URL: contentURL, VersionID: versionID}
+	close(contentCh)
+	isRemoveBucket := false
+	resultCh := clnt.Remove(ctx, opts.isIncomplete, isRemoveBucket, opts.isBypass, opts.isForce && opts.isForceDel, contentCh)
+	for result := range resultCh {
+		if result.Err != nil {
+			errorIf(result.Err.Trace(url), "Failed to remove `%s`.", url)
+			switch result.Err.ToGoError().(type) {
+			case PathInsufficientPermission:
+				// Ignore Permission error.
+				continue
+			}
+			return exitStatus(globalErrorExitStatus)
+		}
+		msg := rmMessage{
+			Key:       path.Join(targetAlias, result.BucketName, result.ObjectName),
+			VersionID: result.ObjectVersionID,
+		}
+		if result.DeleteMarker {
+			msg.DeleteMarker = true
+			msg.VersionID = result.DeleteMarkerVersionID
+		}
+		printMsg(msg)
 	}
 	return nil
 }
@@ -392,7 +401,6 @@ type removeOpts struct {
 	isForceDel        bool
 	olderThan         string
 	newerThan         string
-	encKeyDB          map[string][]prefixSSEPair
 }
 
 func printDryRunMsg(targetAlias string, content *ClientContent, printModTime bool) {
@@ -423,7 +431,7 @@ func listAndRemove(url string, opts removeOpts) error {
 	targetAlias, targetURL, _ := mustExpandAlias(url)
 	clnt, pErr := newClientFromAlias(targetAlias, targetURL)
 	if pErr != nil {
-		errorIf(pErr.Trace(url), "Failed to remove `"+url+"` recursively.")
+		errorIf(pErr.Trace(url), "Failed to remove `%s` recursively.", url)
 		return exitStatus(globalErrorExitStatus) // End of journey.
 	}
 	contentCh := make(chan *ClientContent)
@@ -443,7 +451,7 @@ func listAndRemove(url string, opts removeOpts) error {
 	var perObjectVersions []*ClientContent
 	for content := range clnt.List(ctx, listOpts) {
 		if content.Err != nil {
-			errorIf(content.Err.Trace(url), "Failed to remove `"+url+"` recursively.")
+			errorIf(content.Err.Trace(url), "Failed to remove `%s` recursively.", url)
 			switch content.Err.ToGoError().(type) {
 			case PathInsufficientPermission:
 				// Ignore Permission error.
@@ -461,7 +469,7 @@ func listAndRemove(url string, opts removeOpts) error {
 		}
 
 		if !opts.isRecursive {
-			currentObjectURL := targetAlias + getKey(content)
+			currentObjectURL := getStandardizedURL(targetAlias + getKey(content))
 			standardizedURL := getStandardizedURL(currentObjectURL)
 			if !strings.HasPrefix(url, standardizedURL) {
 				break
@@ -504,7 +512,7 @@ func listAndRemove(url string, opts removeOpts) error {
 							path := path.Join(targetAlias, result.BucketName, result.ObjectName)
 							if result.Err != nil {
 								errorIf(result.Err.Trace(path),
-									"Failed to remove `"+path+"`.")
+									"Failed to remove `%s`.", path)
 								switch result.Err.ToGoError().(type) {
 								case PathInsufficientPermission:
 									// Ignore Permission error.
@@ -562,7 +570,7 @@ func listAndRemove(url string, opts removeOpts) error {
 					path := path.Join(targetAlias, result.BucketName, result.ObjectName)
 					if result.Err != nil {
 						errorIf(result.Err.Trace(path),
-							"Failed to remove `"+path+"`.")
+							"Failed to remove `%s`.", path)
 						switch e := result.Err.ToGoError().(type) {
 						case PathInsufficientPermission:
 							// Ignore Permission error.
@@ -625,7 +633,7 @@ func listAndRemove(url string, opts removeOpts) error {
 					path := path.Join(targetAlias, result.BucketName, result.ObjectName)
 					if result.Err != nil {
 						errorIf(result.Err.Trace(path),
-							"Failed to remove `"+path+"`.")
+							"Failed to remove `%s`.", path)
 						switch result.Err.ToGoError().(type) {
 						case PathInsufficientPermission:
 							// Ignore Permission error.
@@ -655,7 +663,7 @@ func listAndRemove(url string, opts removeOpts) error {
 	for result := range resultCh {
 		path := path.Join(targetAlias, result.BucketName, result.ObjectName)
 		if result.Err != nil {
-			errorIf(result.Err.Trace(path), "Failed to remove `"+path+"` recursively.")
+			errorIf(result.Err.Trace(path), "Failed to remove `%s` recursively.", path)
 			switch result.Err.ToGoError().(type) {
 			case PathInsufficientPermission:
 				// Ignore Permission error.
@@ -680,7 +688,7 @@ func listAndRemove(url string, opts removeOpts) error {
 			// behavior and do not print an error as well.
 			return nil
 		}
-		errorIf(errDummy().Trace(url), "No object/version found to be removed in `"+url+"`.")
+		errorIf(errDummy().Trace(url), "No object/version found to be removed in `%s`.", url)
 		return exitStatus(globalErrorExitStatus)
 	}
 
@@ -692,14 +700,8 @@ func mainRm(cliCtx *cli.Context) error {
 	ctx, cancelRm := context.WithCancel(globalContext)
 	defer cancelRm()
 
-	// Parse encryption keys per command.
-	encKeyDB, err := getEncKeys(cliCtx)
-	fatalIf(err, "Unable to parse encryption keys.")
+	checkRmSyntax(ctx, cliCtx)
 
-	// check 'rm' cli arguments.
-	checkRmSyntax(ctx, cliCtx, encKeyDB)
-
-	// rm specific flags.
 	isIncomplete := cliCtx.Bool("incomplete")
 	isRecursive := cliCtx.Bool("recursive")
 	isFake := cliCtx.Bool("dry-run") || cliCtx.Bool("fake")
@@ -737,7 +739,6 @@ func mainRm(cliCtx *cli.Context) error {
 				isBypass:          isBypass,
 				olderThan:         olderThan,
 				newerThan:         newerThan,
-				encKeyDB:          encKeyDB,
 			})
 		} else {
 			e = removeSingle(url, versionID, removeOpts{
@@ -748,7 +749,6 @@ func mainRm(cliCtx *cli.Context) error {
 				isBypass:     isBypass,
 				olderThan:    olderThan,
 				newerThan:    newerThan,
-				encKeyDB:     encKeyDB,
 			})
 		}
 		if rerr == nil {
@@ -775,7 +775,6 @@ func mainRm(cliCtx *cli.Context) error {
 				isBypass:          isBypass,
 				olderThan:         olderThan,
 				newerThan:         newerThan,
-				encKeyDB:          encKeyDB,
 			})
 		} else {
 			e = removeSingle(url, versionID, removeOpts{
@@ -786,7 +785,6 @@ func mainRm(cliCtx *cli.Context) error {
 				isBypass:     isBypass,
 				olderThan:    olderThan,
 				newerThan:    newerThan,
-				encKeyDB:     encKeyDB,
 			})
 		}
 		if rerr == nil {

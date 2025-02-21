@@ -55,6 +55,10 @@ var catFlags = []cli.Flag{
 		Name:  "tail",
 		Usage: "tail number of bytes at ending of file",
 	},
+	cli.IntFlag{
+		Name:  "part-number",
+		Usage: "download only a specific part number",
+	},
 }
 
 // Display contents of a file.
@@ -64,7 +68,7 @@ var catCmd = cli.Command{
 	Action:       mainCat,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,
-	Flags:        append(append(catFlags, ioFlags...), globalFlags...),
+	Flags:        append(append(catFlags, encCFlag), globalFlags...),
 	CustomHelpTemplate: `NAME:
   {{.HelpName}} - {{.Usage}}
 
@@ -74,8 +78,6 @@ USAGE:
 FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
-ENVIRONMENT VARIABLES:
-  MC_ENCRYPT_KEY:  list of comma delimited prefix=secret values
 
 EXAMPLES:
   1. Stream an object from Amazon S3 cloud storage to mplayer standard input.
@@ -88,11 +90,11 @@ EXAMPLES:
      {{.Prompt}} {{.HelpName}} part.* > complete.img
 
   4. Save an encrypted object from Amazon S3 cloud storage to a local file.
-     {{.Prompt}} {{.HelpName}} --encrypt-key 's3/mysql-backups=32byteslongsecretkeymustbegiven1' s3/mysql-backups/backups-201810.gz > /mnt/data/recent.gz
+     {{.Prompt}} {{.HelpName}} --enc-c "play/my-bucket/=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA" s3/mysql-backups/backups-201810.gz > /mnt/data/recent.gz
 
   5. Display the content of encrypted object. In case the encryption key contains non-printable character like tab, pass the
      base64 encoded string as key.
-     {{.Prompt}} {{.HelpName}} --encrypt-key "play/my-bucket/=MzJieXRlc2xvbmdzZWNyZXRrZQltdXN0YmVnaXZlbjE="  play/my-bucket/my-object
+     {{.Prompt}} {{.HelpName}} --enc-c "play/my-bucket/=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDA" play/my-bucket/my-object
 
   6. Display the content of an object 10 days earlier
      {{.Prompt}} {{.HelpName}} --rewind 10d play/my-bucket/my-object
@@ -164,6 +166,7 @@ type catOpts struct {
 	timeRef   time.Time
 	startO    int64
 	tailO     int64
+	partN     int
 	isZip     bool
 	stdinMode bool
 }
@@ -199,6 +202,7 @@ func parseCatSyntax(ctx *cli.Context) catOpts {
 	o.isZip = ctx.Bool("zip")
 	o.startO = ctx.Int64("offset")
 	o.tailO = ctx.Int64("tail")
+	o.partN = ctx.Int("part-number")
 	if o.tailO != 0 && o.startO != 0 {
 		fatalIf(errInvalidArgument().Trace(), "You cannot specify both --tail and --offset")
 	}
@@ -210,6 +214,9 @@ func parseCatSyntax(ctx *cli.Context) catOpts {
 	}
 	if o.stdinMode && (o.isZip || o.startO != 0 || o.tailO != 0) {
 		fatalIf(errInvalidArgument().Trace(), "You cannot use --zip --tail or --offset with stdin")
+	}
+	if (o.tailO != 0 || o.startO != 0) && o.partN > 0 {
+		fatalIf(errInvalidArgument().Trace(), "You cannot use --part-number with --tail or --offset")
 	}
 
 	return o
@@ -231,7 +238,15 @@ func catURL(ctx context.Context, sourceURL string, encKeyDB map[string][]prefixS
 		// are ignored since some of them have zero size though they
 		// have contents like files under /proc.
 		// 2. extract the version ID if rewind flag is passed
-		if client, content, err := url2Stat(ctx, sourceURL, o.versionID, false, encKeyDB, o.timeRef, o.isZip); err == nil {
+		if client, content, err := url2Stat(ctx, url2StatOptions{
+			urlStr:                  sourceURL,
+			versionID:               o.versionID,
+			fileAttr:                false,
+			encKeyDB:                encKeyDB,
+			timeRef:                 o.timeRef,
+			isZip:                   o.isZip,
+			ignoreBucketExistsCheck: false,
+		}); err == nil {
 			if o.versionID == "" {
 				versionID = content.VersionID
 			}
@@ -242,7 +257,6 @@ func catURL(ctx context.Context, sourceURL string, encKeyDB map[string][]prefixS
 					o.startO = 0
 				}
 			}
-
 			if client.GetURL().Type == objectStorage {
 				size = content.Size - o.startO
 				if size < 0 {
@@ -250,13 +264,15 @@ func catURL(ctx context.Context, sourceURL string, encKeyDB map[string][]prefixS
 					return err.Trace(sourceURL)
 				}
 			}
+			if o.partN != 0 {
+				size = int64(-1)
+			}
 		} else {
 			return err.Trace(sourceURL)
 		}
-		gopts := GetOptions{VersionID: versionID, Zip: o.isZip, RangeStart: o.startO}
+		gopts := GetOptions{VersionID: versionID, Zip: o.isZip, RangeStart: o.startO, PartNumber: o.partN}
 		if reader, err = getSourceStreamFromURL(ctx, sourceURL, encKeyDB, getSourceOpts{
 			GetOptions: gopts,
-			fetchStat:  false,
 			preserve:   false,
 		}); err != nil {
 			return err.Trace(sourceURL)
@@ -316,14 +332,11 @@ func mainCat(cliCtx *cli.Context) error {
 	ctx, cancelCat := context.WithCancel(globalContext)
 	defer cancelCat()
 
-	// Parse encryption keys per command.
-	encKeyDB, err := getEncKeys(cliCtx)
+	encKeyDB, err := validateAndCreateEncryptionKeys(cliCtx)
 	fatalIf(err, "Unable to parse encryption keys.")
 
 	// check 'cat' cli arguments.
 	o := parseCatSyntax(cliCtx)
-
-	// Set command flags from context.
 
 	// handle std input data.
 	if o.stdinMode {
